@@ -20,7 +20,10 @@ from .log import log
 CAT_UNKNOWN_BAND = 0.06         # kg: a settled weight within midpoint ± this is too ambiguous -> "unknown"
 CAT_GAP_FLOOR = 0.15            # kg: references closer than this => "degraded"; re-fit never crosses them
 CAT_SIGMA = 0.07                # kg: gaussian width for the confidence % (≈ the scale noise)
-CAT_PAIR_WINDOW_S = 900         # 15 min: two completed visits within this are DIFFERENT cats (joint assign)
+CAT_PAIR_WINDOW_S = 900         # 15 min: two completed visits within this are DIFFERENT cats (joint assign) ...
+CAT_PAIR_MIN_DIFF = 0.10        # ... but only if their settled weights differ by at least this (kg). A cat often
+                                # re-enters a few times in a row at the same weight; pairing those would split
+                                # one cat's visits between both cats and drive the tracker into "degraded".
 CAT_WINDOW_DAYS = 14            # tracked weight = median of confident visits within this rolling window ...
 CAT_WINDOW_MAX = 10             # ... and at most this many most-recent confident visits per cat
 CAT_JOINT_CONF = 95             # confidence stamped on a 15-min joint assignment / a manual correction
@@ -47,10 +50,11 @@ class CatTracker:
       * Classify by gaussian likelihood (σ≈70 g) to the two references, with an UNKNOWN band: a weight
         within midpoint ± CAT_UNKNOWN_BAND, or while "degraded" (references within CAT_GAP_FLOOR), is
         "unknown". Otherwise the nearer cat, with a confidence % from the likelihood ratio.
-      * 15-MIN RULE: two completed visits within CAT_PAIR_WINDOW_S are DIFFERENT cats and are assigned
-        jointly by weight (heavier -> the heavier cat, lighter -> the lighter cat), overriding the
-        per-visit guess and raising confidence. This is relative, so it still works while degraded (and
-        helps recover).
+      * 15-MIN RULE: two completed visits within CAT_PAIR_WINDOW_S whose settled weights differ by at
+        least CAT_PAIR_MIN_DIFF are DIFFERENT cats and are assigned jointly by weight (heavier -> the
+        heavier cat, lighter -> the lighter cat), overriding the per-visit guess and raising confidence.
+        This is relative, so it still works while degraded (and helps recover). Closer weights are
+        probably the same cat re-entering: no pairing, each visit is classified on its own.
       * Tracked weight = MEDIAN of that cat's confident visits in the rolling window (NOT an EMA, NOT
         the last reading). A 7-day trend and the current gap are derived from the same samples.
       * References update ONLY from (a) a confident rolling re-fit to the per-cat medians, which keeps
@@ -172,7 +176,8 @@ class CatTracker:
             cat, conf, confident = self.lo, CAT_SINGLE_CONF, True
         else:
             cat, conf, confident = self._classify(w)
-            if self._last is not None and 0 <= (now - self._last["at"]) <= CAT_PAIR_WINDOW_S:
+            if (self._last is not None and 0 <= (now - self._last["at"]) <= CAT_PAIR_WINDOW_S
+                    and abs(w - self._last["w"]) >= CAT_PAIR_MIN_DIFF - 1e-9):
                 prev = self._last
                 cat, prev_cat = (self.hi, self.lo) if w >= prev["w"] else (self.lo, self.hi)
                 conf, confident = CAT_JOINT_CONF, True

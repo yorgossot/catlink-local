@@ -63,10 +63,25 @@ class TwoCatTests(TrackerCase):
     def test_fifteen_minute_rule(self):
         t = self.tracker()
         r1, r2 = {}, {}
-        t.on_visit(3.85, r1, now=self.T0)          # inside the unknown band on its own
-        t.on_visit(3.94, r2, now=self.T0 + 300)    # 5 min later: a different cat, the heavier one
+        t.on_visit(3.87, r1, now=self.T0)          # inside the unknown band on its own
+        t.on_visit(3.97, r2, now=self.T0 + 300)    # 5 min later, 100 g heavier: a different cat
         self.assertEqual((r2["cat"], r2["conf"]), ("cat_b", c.CAT_JOINT_CONF))
         self.assertEqual((r1["cat"], r1["conf"]), ("cat_a", c.CAT_JOINT_CONF))
+
+    def test_same_weight_revisits_not_split(self):
+        # One cat re-entering 4x in 10 min at the same weight must not be split between the cats.
+        t = self.tracker()
+        rows = []
+        for dt, w in ((0, 4.61), (120, 4.64), (360, 4.61), (600, 4.60)):
+            r = {}
+            t.on_visit(w, r, now=self.T0 + dt)
+            rows.append(r)
+        self.assertEqual([r["cat"] for r in rows], ["cat_b"] * 4)
+        self.assertEqual(t.samples["cat_a"], [])
+        self.assertFalse(t.degraded)
+        r = {}
+        t.on_visit(3.22, r, now=self.T0 + 2700)
+        self.assertEqual(r["cat"], "cat_a")
 
     def test_beyond_fifteen_minutes_not_paired(self):
         t = self.tracker()

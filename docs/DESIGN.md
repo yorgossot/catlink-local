@@ -119,8 +119,9 @@ treat labels as estimates.
     confidence %;
   - a settled weight within ±60 g of the midpoint is `unknown`;
   - if the references are closer than 150 g the tracker is **degraded** and labels everything `unknown`;
-  - **15-minute rule**: two visits within 15 min are taken to be different cats and assigned jointly
-    (heavier → heavier cat), which also helps recover from a degraded state;
+  - **15-minute rule**: two visits within 15 min whose weights differ by at least 100 g are taken to be
+    different cats and assigned jointly (heavier → heavier cat), which also helps recover from a degraded
+    state. Closer weights are treated as the same cat coming back, which happens often;
   - tracked weight = median of that cat's confident visits in the last 14 days (at most 10), not an
     average of the latest readings; the 7-day trend and the gap come from the same samples (within 20 g
     reads "steady");
