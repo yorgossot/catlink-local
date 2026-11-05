@@ -1,0 +1,13 @@
+# Append to the file named by `acl_file` in your mosquitto.conf, then `sudo systemctl reload mosquitto`.
+# The gateway's own user: state/diag/visits/availability and the command topics under catlink/litterbox,
+# plus write-only access to its retained discovery configs. Adjust if you changed CATLINK_BASE,
+# CATLINK_DISCOVERY_PREFIX or CATLINK_NODE.
+
+user catlink
+topic readwrite catlink/litterbox/#
+topic write homeassistant/+/catlink_litterbox/#
+
+# Home Assistant's own user must be able to read catlink/litterbox/# and homeassistant/#, and to write
+# catlink/litterbox/+/set (commands). A typical HA user already has this, e.g.:
+#   user homeassistant
+#   topic readwrite #

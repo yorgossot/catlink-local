@@ -1,0 +1,33 @@
+# catlink-local gateway: the MQTT broker the litter box connects to, plus the Home Assistant bridge.
+# Installed by install.sh to /etc/systemd/system/. Configuration: /etc/catlink-local/catlink-local.env.
+# The command half is off unless CATLINK_COMMANDS=1: set it in the env file, then restart this unit.
+# Logs: journalctl -u catlink-gateway -o cat   (one JSON object per line)
+[Unit]
+Description=catlink-local gateway (box-facing MQTT broker + Home Assistant bridge)
+Documentation=https://github.com/yorgossot/catlink-local
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/catlink-local/catlink-local.env
+# The Mosquitto password: systemd reads this root-only file and exposes a copy to the service under
+# $CREDENTIALS_DIRECTORY/ha_mqtt_pass. It never appears in the environment, in `ps`, or in the log.
+LoadCredential=ha_mqtt_pass:/etc/catlink-local/ha_mqtt.pass
+ExecStart=/usr/bin/python3 -I -u /opt/catlink-local/gateway.py
+DynamicUser=yes
+# visits.jsonl + cats.json live in /var/lib/catlink-local (exported as $STATE_DIRECTORY).
+StateDirectory=catlink-local
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET
+MemoryMax=64M
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

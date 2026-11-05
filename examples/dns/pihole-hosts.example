@@ -1,0 +1,15 @@
+# Pi-hole v6: save as /etc/pihole/hosts/catlink-local
+# (for Pi-hole in Docker: the host directory mounted at /etc/pihole/hosts in the container).
+# FTL watches that directory, so the file is picked up without a restart. A name already in the
+# resolver's cache can keep its old answer until it expires: flush with `pihole restartdns` if a
+# check with dig still returns a vendor address. See docs/SETUP.md step 3.
+#
+# Replace <host-lan-ip> with the address catlink-local listens on, and <instance> with the prefix your
+# box looks up (read it from your DNS query log, docs/SETUP.md step 1). Redirect all four names.
+# If the responder listens on a different address than the gateway, point the two auth names at
+# CATLINK_AUTH_BIND_IP and the two MQTT names at CATLINK_BOX_BIND_IP.
+
+<host-lan-ip> iot-auth-global.aliyuncs.com
+<host-lan-ip> iot-auth-global-x.aliyuncs.com
+<host-lan-ip> <instance>.mqtt.iothub.aliyuncs.com
+<host-lan-ip> <instance>-x.mqtt.iothub.aliyuncs.com

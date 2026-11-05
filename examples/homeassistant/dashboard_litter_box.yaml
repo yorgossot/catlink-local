@@ -1,0 +1,386 @@
+# Litter box controls dashboard. Built-in cards only.
+#
+# Entity ids below assume the default CATLINK_DEVICE_NAME ("CATLINK Open X"). They are minted by Home
+# Assistant from the device name, so check yours in Settings -> Devices & services -> Entities.
+#
+# Use: create a dashboard, open its raw configuration editor and paste this file, or save it as a
+# YAML-mode dashboard file.
+# - The buttons, selects, numbers and switches exist only with CATLINK_COMMANDS=1.
+# - The cat rows at the bottom of Diagnostics exist only with CATLINK_CATS set; replace cat_a / cat_b with
+#   your slugs, or delete those rows.
+#
+# Every movement tile (Clean, Level, Pause, Resume, Cancel) sets icon_tap_action: none. A tile's default
+# icon tap on a button entity presses it immediately, skipping the confirmation; Clean and Level keep a
+# confirmation on the tile tap.
+title: Litter box
+views:
+- title: Litter box
+  path: litter-box
+  cards:
+
+  # ---- PRIMARY ACTIONS ----------------------------------------------------
+  - type: markdown
+    content: '#### Primary actions'
+  - type: conditional
+    conditions:
+    - entity: binary_sensor.catlink_open_x_litter_box_occupied
+      state: 'on'
+    card:
+      type: markdown
+      content: '**⚠ A cat is in the box**'
+  # The box reports only full / not full (IR curtain), no fill level. The drawer is mentioned only while
+  # it is out.
+  - type: markdown
+    content: >-
+      {%- set b = states('binary_sensor.catlink_open_x_waste_bin_full') -%}
+      {%- if b == 'on' -%}**⚠ Waste bin full — empty it.** The box will not clean until it is emptied.
+      {%- elif b == 'off' -%}Waste bin: not full
+      {%- else -%}Waste bin: unknown{%- endif -%}
+      {%- if is_state('binary_sensor.catlink_open_x_waste_drawer', 'on') %} · **waste drawer is out**{% endif -%}
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+    - type: tile
+      entity: button.catlink_open_x_clean_now
+      name: Clean
+      icon: mdi:broom
+      color: green
+      hide_state: true
+      # icon tap on a button-domain tile would press with NO confirmation: disabled
+      icon_tap_action:
+        action: none
+      tap_action:
+        action: perform-action
+        perform_action: button.press
+        target:
+          entity_id: button.catlink_open_x_clean_now
+        confirmation:
+          text: Start a clean cycle? Make sure the cats are clear of the box.
+    - type: tile
+      entity: button.catlink_open_x_level_litter
+      name: Level
+      icon: mdi:format-horizontal-align-center
+      color: orange
+      hide_state: true
+      # icon tap on a button-domain tile would press with NO confirmation: disabled
+      icon_tap_action:
+        action: none
+      tap_action:
+        action: perform-action
+        perform_action: button.press
+        target:
+          entity_id: button.catlink_open_x_level_litter
+        confirmation:
+          text: Level the litter now? Make sure the cats are clear of the box.
+
+  - type: grid
+    columns: 3
+    square: false
+    cards:
+    - type: tile
+      entity: button.catlink_open_x_pause
+      name: Pause
+      icon: mdi:pause
+      color: grey
+      hide_state: true
+      # icon tap on a button-domain tile would press with NO confirmation: disabled
+      icon_tap_action:
+        action: none
+      tap_action:
+        action: perform-action
+        perform_action: button.press
+        target:
+          entity_id: button.catlink_open_x_pause
+    - type: tile
+      entity: button.catlink_open_x_resume
+      name: Resume
+      icon: mdi:play
+      color: green
+      hide_state: true
+      # icon tap on a button-domain tile would press with NO confirmation: disabled
+      icon_tap_action:
+        action: none
+      tap_action:
+        action: perform-action
+        perform_action: button.press
+        target:
+          entity_id: button.catlink_open_x_resume
+    - type: tile
+      entity: button.catlink_open_x_cancel
+      name: Cancel
+      icon: mdi:stop
+      color: red
+      hide_state: true
+      # icon tap on a button-domain tile would press with NO confirmation: disabled
+      icon_tap_action:
+        action: none
+      tap_action:
+        action: perform-action
+        perform_action: button.press
+        target:
+          entity_id: button.catlink_open_x_cancel
+
+  # ---- MODE & LITTER ------------------------------------------------------
+  - type: markdown
+    content: '#### Mode & litter'
+  - type: grid
+    columns: 1
+    square: false
+    cards:
+    - type: tile
+      entity: select.catlink_open_x_mode
+      name: Mode
+      icon: mdi:tune-variant
+      features:
+      - type: select-options
+    - type: tile
+      entity: select.catlink_open_x_litter_type
+      name: Litter type
+      icon: mdi:grain
+      features:
+      - type: select-options
+
+  # ---- AUTOMATIC-MODE CLEANING -------------------------------------------
+  # Clean delay, soft-stool burial and burial delay only matter in Automatic mode, so they are shown
+  # only while the mode sensor reads "automatic". The clean delay buttons offer the values the box
+  # accepts (1, 3, 5, 7, 10).
+  - type: conditional
+    conditions:
+    - entity: sensor.catlink_open_x_litter_box_mode
+      state: automatic
+    card:
+      type: vertical-stack
+      cards:
+      - type: markdown
+        content: '#### Automatic-mode cleaning'
+      - type: tile
+        entity: number.catlink_open_x_clean_delay
+        name: Clean delay
+        icon: mdi:timer-sand
+        features:
+        - type: numeric-input
+          style: buttons
+      - type: grid
+        columns: 5
+        square: false
+        cards:
+        - type: button
+          name: 1 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_clean_delay
+            data:
+              value: 1
+        - type: button
+          name: 3 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_clean_delay
+            data:
+              value: 3
+        - type: button
+          name: 5 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_clean_delay
+            data:
+              value: 5
+        - type: button
+          name: 7 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_clean_delay
+            data:
+              value: 7
+        - type: button
+          name: 10 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_clean_delay
+            data:
+              value: 10
+      - type: tile
+        entity: switch.catlink_open_x_soft_stool_burial
+        name: Soft-stool burial
+        icon: mdi:shovel
+        features:
+        - type: toggle
+      - type: tile
+        entity: number.catlink_open_x_burial_delay
+        name: Burial delay
+        icon: mdi:timer-sand
+        features:
+        - type: numeric-input
+          style: buttons
+      - type: grid
+        columns: 5
+        square: false
+        cards:
+        - type: button
+          name: 1 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_burial_delay
+            data:
+              value: 1
+        - type: button
+          name: 3 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_burial_delay
+            data:
+              value: 3
+        - type: button
+          name: 5 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_burial_delay
+            data:
+              value: 5
+        - type: button
+          name: 10 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_burial_delay
+            data:
+              value: 10
+        - type: button
+          name: 15 min
+          show_icon: false
+          show_state: false
+          tap_action:
+            action: perform-action
+            perform_action: number.set_value
+            target:
+              entity_id: number.catlink_open_x_burial_delay
+            data:
+              value: 15
+  - type: conditional
+    conditions:
+    - entity: sensor.catlink_open_x_litter_box_mode
+      state_not: automatic
+    card:
+      type: markdown
+      content: >
+        <small>Automatic-mode cleaning — switch **Mode** to *Automatic* above to
+        use clean delay, soft-stool burial & burial delay.</small>
+
+  # ---- NOTIFICATIONS & TOGGLES -------------------------------------------
+  # Child lock and kitty mode have no readback from the box: their switches show the last value sent.
+  - type: markdown
+    content: '#### Notifications & toggles'
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+    - type: tile
+      entity: switch.catlink_open_x_indicator_light
+      name: Light
+      icon: mdi:lightbulb
+      features:
+      - type: toggle
+    - type: tile
+      entity: switch.catlink_open_x_notification_sound
+      name: Sound
+      icon: mdi:volume-high
+      features:
+      - type: toggle
+    - type: tile
+      entity: switch.catlink_open_x_continuous_cleaning
+      name: Continuous
+      icon: mdi:autorenew
+      features:
+      - type: toggle
+    - type: tile
+      entity: switch.catlink_open_x_child_lock
+      name: Child lock
+      icon: mdi:lock
+      features:
+      - type: toggle
+    - type: tile
+      entity: switch.catlink_open_x_kitty_mode
+      name: Kitty mode
+      icon: mdi:cat
+      features:
+      - type: toggle
+
+  # ---- DIAGNOSTICS (bottom) -----------------------------------------------
+  # Low-confidence and not-yet-mapped signals, plus the cat-identification numbers.
+  - type: markdown
+    content: >
+      <small>Diagnostics — raw gateway signals, low confidence.</small>
+  - type: entities
+    state_color: false
+    entities:
+    - entity: sensor.catlink_open_x_live_scale
+      name: Live scale
+    - entity: sensor.catlink_open_x_wi_fi_signal
+      name: Wi-Fi signal
+    - entity: sensor.catlink_open_x_box_clock
+      name: Box clock
+    - entity: sensor.catlink_open_x_night_mode
+      name: Night mode
+    - entity: sensor.catlink_open_x_night_start_hour
+      name: Night start hour
+    - entity: sensor.catlink_open_x_night_end_hour
+      name: Night end hour
+    - entity: sensor.catlink_open_x_schedule_slot_count
+      name: Schedule slot count
+    - entity: sensor.catlink_open_x_unmapped_heartbeat_bytes
+      name: Unmapped heartbeat bytes
+    - entity: sensor.catlink_open_x_unmapped_bytes_changed
+      name: Unmapped bytes changed
+    - entity: sensor.catlink_open_x_unmapped_change_count
+      name: Unmapped change count
+    - entity: sensor.catlink_open_x_last_unknown_frame
+      name: Last unknown frame
+    # cat identification (CATLINK_CATS only)
+    - entity: sensor.catlink_open_x_last_visit_cat
+      name: Last visit (cat · confidence)
+    - entity: sensor.catlink_open_x_cat_gap
+      name: Cat weight gap
+    - entity: sensor.catlink_open_x_cat_a_trend_7d
+      name: Cat a 7-day trend
+    - entity: sensor.catlink_open_x_cat_b_trend_7d
+      name: Cat b 7-day trend
+    - entity: sensor.catlink_open_x_labelled_pct
+      name: Visits labelled
+    - entity: sensor.catlink_open_x_correction_count
+      name: Corrections

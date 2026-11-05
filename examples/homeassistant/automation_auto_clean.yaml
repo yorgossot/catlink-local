@@ -1,0 +1,55 @@
+# Local auto-clean after a visit. Off the cloud, the box does not clean after visits by itself.
+#
+# Entity ids below assume the default CATLINK_DEVICE_NAME ("CATLINK Open X"). They are minted by Home
+# Assistant from the device name, so check yours in Settings -> Devices & services -> Entities.
+# Requires CATLINK_COMMANDS=1 (the Clean button and the clean-delay number exist only then).
+#
+# Paste into automations.yaml (or create a new automation in the UI and paste in YAML mode).
+#
+# How it behaves:
+# - fires only when the visit counter goes UP, with old and new states both numbers: not on attribute
+#   updates of recent_visits, and not when the counter resets to 0 as the waste drawer goes back in;
+# - only in Automatic mode and only while the waste bin is not full (the box refuses to clean then);
+# - waits the box's clean delay, then checks the box is unoccupied and the bin still not full;
+# - mode: restart, so a visit during the wait restarts the timer and the box cleans once.
+# The gateway's own interlock still applies to the press (fresh idle heartbeat, not occupied, not
+# touched, scale near empty); a refused press is logged as command_refused and nothing moves.
+
+- id: catlink_auto_clean_after_visit
+  alias: 'CATLINK: auto-clean after visit'
+  description: >-
+    After a completed visit, wait the configured clean delay and, if the box is clear, the waste
+    bin is not full and Mode is Automatic, press Clean. The gateway's interlock and the box's own
+    sensors still decide whether the mechanism moves.
+  mode: restart
+  triggers:
+  - trigger: state
+    entity_id: sensor.catlink_open_x_visit_counter
+    to: ~
+    not_from:
+    - unknown
+    - unavailable
+  conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.from_state is not none and trigger.to_state is not none
+         and is_number(trigger.from_state.state) and is_number(trigger.to_state.state)
+         and trigger.to_state.state | float > trigger.from_state.state | float }}
+  - condition: state
+    entity_id: sensor.catlink_open_x_litter_box_mode
+    state: automatic
+  - condition: state
+    entity_id: binary_sensor.catlink_open_x_waste_bin_full
+    state: 'off'
+  actions:
+  - delay:
+      minutes: "{{ states('number.catlink_open_x_clean_delay') | int(5) }}"
+  - condition: state
+    entity_id: binary_sensor.catlink_open_x_litter_box_occupied
+    state: 'off'
+  - condition: state
+    entity_id: binary_sensor.catlink_open_x_waste_bin_full
+    state: 'off'
+  - action: button.press
+    target:
+      entity_id: button.catlink_open_x_clean_now

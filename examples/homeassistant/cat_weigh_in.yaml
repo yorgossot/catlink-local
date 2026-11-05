@@ -1,0 +1,71 @@
+# Kitchen-scale weigh-ins for cat identification, as a Home Assistant package.
+#
+# Requires CATLINK_CATS, e.g. CATLINK_CATS=cat_a=3.20,cat_b=4.60 (lighter first). Replace cat_a / cat_b
+# with your slugs; for one cat, delete the cat_b parts. Topics assume the default CATLINK_BASE
+# (catlink/litterbox). Works in both modes: the set_ref topics are handled inside the gateway and never
+# reach the box.
+#
+# Entering a weight re-seeds that cat's reference weight. With two cats the gateway keeps the references
+# at least 150 g apart. This is the way to re-seed after the first visit: the kg values in CATLINK_CATS
+# are used only until the gateway's cats.json exists.
+#
+# Install as a package: save as <config>/packages/catlink_weigh_in.yaml and make sure configuration.yaml has
+#   homeassistant:
+#     packages: !include_dir_named packages
+# then restart Home Assistant. (Or copy the input_number entries into configuration.yaml and the two
+# automations into automations.yaml.)
+
+input_number:
+  catlink_cat_a_weigh_in:
+    name: Cat a weigh-in
+    min: 0.5
+    max: 10
+    step: 0.01
+    unit_of_measurement: kg
+    mode: box
+    icon: mdi:scale
+  catlink_cat_b_weigh_in:
+    name: Cat b weigh-in
+    min: 0.5
+    max: 10
+    step: 0.01
+    unit_of_measurement: kg
+    mode: box
+    icon: mdi:scale
+
+automation:
+- id: catlink_weigh_in_cat_a
+  alias: 'CATLINK: publish cat_a weigh-in'
+  description: Send a kitchen-scale weight to the gateway as cat_a's reference.
+  mode: restart
+  triggers:
+  - trigger: state
+    entity_id: input_number.catlink_cat_a_weigh_in
+  conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.to_state.state not in ['unknown', 'unavailable', 'none']
+         and trigger.from_state.state not in ['unknown', 'unavailable', 'none'] }}
+  actions:
+  - action: mqtt.publish
+    data:
+      topic: catlink/litterbox/set_ref_cat_a/set
+      payload: "{{ states('input_number.catlink_cat_a_weigh_in') }}"
+
+- id: catlink_weigh_in_cat_b
+  alias: 'CATLINK: publish cat_b weigh-in'
+  description: Send a kitchen-scale weight to the gateway as cat_b's reference.
+  mode: restart
+  triggers:
+  - trigger: state
+    entity_id: input_number.catlink_cat_b_weigh_in
+  conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.to_state.state not in ['unknown', 'unavailable', 'none']
+         and trigger.from_state.state not in ['unknown', 'unavailable', 'none'] }}
+  actions:
+  - action: mqtt.publish
+    data:
+      topic: catlink/litterbox/set_ref_cat_b/set
+      payload: "{{ states('input_number.catlink_cat_b_weigh_in') }}"

@@ -1,0 +1,11 @@
+# Secrets and state must never be committed
+*.pem
+*.key
+*.jsonl
+*.env
+cats.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

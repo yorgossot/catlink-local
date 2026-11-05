@@ -1,0 +1,38 @@
+# Notify when the litter box's waste bin becomes full. While full, the box refuses to clean.
+#
+# Entity ids below assume the default CATLINK_DEVICE_NAME ("CATLINK Open X"). They are minted by Home
+# Assistant from the device name, so check yours in Settings -> Devices & services -> Entities.
+# Works in sensor-only mode (CATLINK_COMMANDS=0).
+#
+# How it behaves:
+# - only a real off -> on change held for 1 minute (rides out a bag flickering in the IR curtain);
+# - never from unknown/unavailable, so restarting HA or the gateway with a full bin stays quiet;
+# - once per full event: the bin must have been clear for at least 5 minutes before it went full.
+
+- id: catlink_waste_bin_full
+  alias: 'CATLINK: waste bin full'
+  description: >-
+    Notify when the waste bin goes full (held 1 min, after being clear for at least 5 min).
+  mode: single
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.catlink_open_x_waste_bin_full
+    from: 'off'
+    to: 'on'
+    for:
+      minutes: 1
+  conditions:
+  - condition: template
+    value_template: >-
+      {{ (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() >= 300 }}
+  actions:
+  - action: persistent_notification.create
+    data:
+      notification_id: catlink_bin_full
+      title: Litter box
+      message: The waste bin is full. Empty it; the box will not clean until then.
+  # Or a push to your phone (the service name depends on your companion app):
+  # - action: notify.mobile_app_<your_phone>
+  #   data:
+  #     title: Litter box
+  #     message: The waste bin is full. Empty it; the box will not clean until then.

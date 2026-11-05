@@ -1,0 +1,11 @@
+# Plain dnsmasq: save as /etc/dnsmasq.d/catlink-local.conf, then `sudo systemctl restart dnsmasq`.
+# `address=/name/ip` answers for the name and every name below it.
+#
+# Replace <host-lan-ip> and <instance> as described in docs/SETUP.md (steps 1 and 3).
+# If the responder listens on a different address than the gateway, point the two auth names at
+# CATLINK_AUTH_BIND_IP and the two MQTT names at CATLINK_BOX_BIND_IP.
+
+address=/iot-auth-global.aliyuncs.com/<host-lan-ip>
+address=/iot-auth-global-x.aliyuncs.com/<host-lan-ip>
+address=/<instance>.mqtt.iothub.aliyuncs.com/<host-lan-ip>
+address=/<instance>-x.mqtt.iothub.aliyuncs.com/<host-lan-ip>

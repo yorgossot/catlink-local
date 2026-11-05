@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # 22.04: setup-python still provides 3.9 there
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit + offline tests (stdlib only, loopback only)
+        run: python -m unittest discover -s tests -v
+      - name: Syntax check of the launchers and the package under -I
+        run: python -I -m py_compile gateway.py authresp.py catlink_local/*.py
+
+  leakcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Leak check
+        run: bash tools/leakcheck.sh

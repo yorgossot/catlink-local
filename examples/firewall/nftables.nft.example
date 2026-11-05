@@ -1,0 +1,28 @@
+#!/usr/sbin/nft -f
+# catlink-local: only the litter box may reach the gateway (TCP 1883) and the login responder (TCP 443).
+#
+# The box speaks plaintext MQTT and the gateway accepts any credentials, so the network is what keeps
+# other devices out. The services also pin the peer by MAC; this is the outer layer.
+#
+# Replace <host-lan-ip> (CATLINK_BOX_BIND_IP / CATLINK_AUTH_BIND_IP) and <box-mac> (CATLINK_BOX_MAC).
+# Load:   sudo nft -f nftables.nft.example
+# Persist: include it from /etc/nftables.conf (Debian: `include "/etc/nftables.d/*.nft"` style).
+#
+# This table only drops: anything not from the box to these two ports is refused here. If your host
+# firewall already has an input chain with `policy drop`, add the accept rule there as well, e.g.
+#   iifname "<lan-interface>" ether saddr <box-mac> ip daddr <host-lan-ip> tcp dport { 1883, 443 } accept
+#
+# iptables equivalent:
+#   iptables -A INPUT -p tcp -d <host-lan-ip> -m multiport --dports 1883,443 -m mac --mac-source <box-mac> -j ACCEPT
+#   iptables -A INPUT -p tcp -d <host-lan-ip> -m multiport --dports 1883,443 -j DROP
+# ufw cannot match a MAC address in its CLI; add the two iptables lines to /etc/ufw/before.rules.
+
+table inet catlink_local {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		# WARNING: this drops EVERY device other than the box that connects to <host-lan-ip> on 1883 or 443.
+		# Never run your household Mosquitto (or any service other devices use) on that address and port;
+		# bind it to 127.0.0.1 or another address instead.
+		ip daddr <host-lan-ip> tcp dport { 1883, 443 } ether saddr != <box-mac> counter drop comment "catlink-local: box only"
+	}
+}

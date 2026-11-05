@@ -1,0 +1,116 @@
+# Cats overview dashboard: look-only (nothing here moves the box). Built-in cards only.
+#
+# Entity ids below assume the default CATLINK_DEVICE_NAME ("CATLINK Open X"). They are minted by Home
+# Assistant from the device name, so check yours in Settings -> Devices & services -> Entities.
+#
+# Requires CATLINK_CATS with two cats, e.g. CATLINK_CATS=cat_a=3.20,cat_b=4.60. Replace cat_a / cat_b
+# (entity ids and the *_trend_word attributes) with your slugs, and the tile names with your cats' names.
+# Without cats, delete the two tiles, the history graph and the Cat column; the rest works in sensor-only
+# mode.
+#
+# Use: create a dashboard, open its raw configuration editor and paste this file, or save it as a
+# YAML-mode dashboard file.
+title: Cats
+views:
+- title: Cats
+  path: cats
+  cards:
+
+  # ---- the two cats: name + weight + plain trend word -----------------------
+  # <slug>_trend_word (gaining / losing / steady) is an attribute of the weight sensor.
+  - type: grid
+    columns: 2
+    square: false
+    cards:
+    - type: tile
+      entity: sensor.catlink_open_x_cat_a_weight
+      name: Cat A
+      icon: mdi:cat
+      color: light-blue
+      state_content:
+      - state
+      - cat_a_trend_word
+    - type: tile
+      entity: sensor.catlink_open_x_cat_b_weight
+      name: Cat B
+      icon: mdi:cat
+      color: purple
+      state_content:
+      - state
+      - cat_b_trend_word
+
+  # ---- at a glance: litter box, waste bin, drawer --------------------------
+  # The waste bin line is always shown; the box reports only full / not full, no fill level.
+  - type: markdown
+    content: |
+      {%- set L = namespace(lines=[]) -%}
+      {%- set st = states('sensor.catlink_open_x_litter_box_state') -%}
+      {%- if st in ['unavailable', 'unknown'] -%}
+      {%- set L.lines = L.lines + ['**Litter box** · ⚠ offline (box not reporting)'] -%}
+      {%- else -%}
+      {%- set occ = 'cat inside' if is_state('binary_sensor.catlink_open_x_litter_box_occupied', 'on') else 'free' -%}
+      {%- set cln = 'cleaning' if is_state('binary_sensor.catlink_open_x_litter_box_cleaning', 'on') else st -%}
+      {%- set warn = ' ⚠' if st not in ['idle', 'cleaning'] else '' -%}
+      {%- set L.lines = L.lines + ['**Litter box** · ' ~ occ ~ ' · ' ~ cln ~ warn] -%}
+      {%- endif -%}
+      {%- set bin = states('binary_sensor.catlink_open_x_waste_bin_full') -%}
+      {%- set bl = '⚠ **full — empty it** (cleaning is paused)' if bin == 'on' else ('not full' if bin == 'off' else 'unknown') -%}
+      {%- set dr = ' · drawer out' if is_state('binary_sensor.catlink_open_x_waste_drawer', 'on') else '' -%}
+      {%- set L.lines = L.lines + ['Waste bin · ' ~ bl ~ dr] -%}
+      {{ L.lines | join('<br>') }}
+
+  # ---- weights over time (14 days) ------------------------------------------
+  - type: history-graph
+    title: Weights over time
+    hours_to_show: 336
+    entities:
+    - entity: sensor.catlink_open_x_cat_a_weight
+      name: Cat A
+    - entity: sensor.catlink_open_x_cat_b_weight
+      name: Cat B
+
+  # ---- recent visits: 10 newest (the gateway keeps 15) ----------------------
+  # recent_visits is an attribute of the Visit counter sensor, newest first.
+  - type: markdown
+    content: |
+      #### Recent visits
+      {% set visits = state_attr('sensor.catlink_open_x_visit_counter', 'recent_visits') or [] %}
+      {% set ns = namespace(rows=[]) %}
+      {% for v in visits[:10] %}{% set who = '—' if (v.cat in [none, 'unknown']) else (v.cat | replace('_', ' ') | capitalize) %}{% set ns.rows = ns.rows + ['| ' ~ v.time ~ ' | ' ~ who ~ ' | ' ~ v.weight ~ ' kg | ' ~ v.duration ~ ' | ' ~ v.deposit ~ ' g |'] %}{% endfor %}
+      {% if visits %}
+      | Time | Cat | Weight | Duration | Deposit |
+      |---|---|---|---|---|
+      {{ ns.rows | join('\n') }}
+      {% else %}
+      _No visits recorded yet — the table fills as the cats use the box._
+      {% endif %}
+
+  # ---- optional: "the last visit was ..." correction buttons ---------------
+  # Each tap relabels the most recent visit inside the gateway (topic correct_last, never sent to the
+  # box) and counts as a correction. Uncomment to use; payload is the cat's slug.
+  # - type: grid
+  #   columns: 2
+  #   square: false
+  #   cards:
+  #   - type: button
+  #     name: Last visit was Cat A
+  #     icon: mdi:cat
+  #     tap_action:
+  #       action: perform-action
+  #       perform_action: mqtt.publish
+  #       data:
+  #         topic: catlink/litterbox/correct_last/set
+  #         payload: cat_a
+  #       confirmation:
+  #         text: Mark the last visit as Cat A?
+  #   - type: button
+  #     name: Last visit was Cat B
+  #     icon: mdi:cat
+  #     tap_action:
+  #       action: perform-action
+  #       perform_action: mqtt.publish
+  #       data:
+  #         topic: catlink/litterbox/correct_last/set
+  #         payload: cat_b
+  #       confirmation:
+  #         text: Mark the last visit as Cat B?
