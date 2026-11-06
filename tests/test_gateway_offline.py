@@ -391,7 +391,7 @@ class GatewayScenarioTests(unittest.TestCase):
             check("visit_count carries recent_visits attributes",
                   cfgs.get("sensor/visit_count", {}).get("json_attributes_topic") == BASE + "/visits")
             measured = {"sensor/live_scale", "sensor/last_visit_weight", "sensor/last_deposit_weight",
-                        "sensor/wifi_signal"} | ({"sensor/cat_a_weight", "sensor/cat_b_weight"} if cats else set())
+                        "sensor/wifi_signal", "sensor/litter_weight"} | ({"sensor/cat_a_weight", "sensor/cat_b_weight"} if cats else set())
             with_class = {k for k, c in cfgs.items() if c.get("state_class") == "measurement"}
             check("state_class measurement exactly on the numeric measurements", with_class == measured,
                   sorted(with_class ^ measured))
@@ -683,6 +683,69 @@ class GatewayScenarioTests(unittest.TestCase):
               '"event":"drawer_event"' in text and '"unknown_frame","command":"0x295a"' not in text)
         check("every box frame logged in full hex", '"event":"publish"' in text and '"payload_hex":"fc' in text)
         self.assertEqual([], self.failures, "\n" + "\n".join(self.failures))
+
+
+class LitterWeightAndRestoreTests(unittest.TestCase):
+    """litter_weight = median of the last trusted empty baselines (idle + unoccupied only), and a restart
+    restores the last-visit sensors from the persisted visit log."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="catlink_gw_")
+        self.visits = os.path.join(self.dir, "visits.jsonl")
+        logmod.configure(writer=lambda line: None)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def feed(self, gs, scale, occupied=False, state="idle"):
+        gs.state.update({"live_scale": scale, "occupied": occupied, "state": state})
+        gs._update_deposit()
+        return gs.state.get("litter_weight")
+
+    def test_litter_weight(self):
+        gs = gwmod.GatewayState(self.visits)
+        self.assertIsNone(self.feed(gs, 3.20))
+        self.assertIsNone(self.feed(gs, 3.22))                 # not published before 3 readings
+        self.assertEqual(self.feed(gs, 3.21), 3.21)            # median of the first 3
+        for scale in (0.66, 0.70):                             # mid-cycle readings: not idle -> ignored
+            self.feed(gs, scale, state="cleaning")
+        self.feed(gs, 5.40, occupied=True)                     # a cat on the scale -> ignored
+        self.assertEqual(gs.state["litter_weight"], 3.21)
+        self.feed(gs, 1.10)                                    # ONE low idle reading: the median rides it out
+        self.assertEqual(gs.state["litter_weight"], 3.21)
+        for _ in range(3):                                     # litter really removed: followed
+            self.feed(gs, 0.70)
+        self.assertEqual(gs.state["litter_weight"], 0.70)
+        for _ in range(6):                                     # top-up: adopted after the re-litter confirmation
+            self.feed(gs, 3.25)
+        self.assertEqual(gs.state["litter_weight"], 3.25)
+
+    def write_visit(self, **row):
+        base = {"time": "Jan 7 09:15", "peak": 3.4, "duration": "3m 28s", "weight": 3.05, "deposit": 40}
+        base.update(row)
+        with open(self.visits, "w") as fh:
+            fh.write(json.dumps(base) + "\n")
+
+    def test_restart_restores_last_visit(self):
+        self.write_visit()
+        s = gwmod.GatewayState(self.visits).state
+        self.assertEqual((s.get("last_visit_weight"), s.get("last_visit_duration"), s.get("last_visit_seconds"),
+                          s.get("last_deposit_weight")), (3.05, "3:28", 208, 40))
+        self.assertNotIn("last_visit_cat", s)
+
+    def test_restart_restores_last_cat(self):
+        self.write_visit(cat="cat_a", conf=82)
+        gs = gwmod.GatewayState(self.visits, cats=[("cat_a", 3.2), ("cat_b", 4.6)],
+                                cats_file=os.path.join(self.dir, "cats.json"))
+        self.assertEqual(gs.state.get("last_visit_cat"), "Cat a 82%")
+        self.assertEqual(gs.state.get("last_visit_weight"), 3.05)
+
+    def test_restart_ignores_a_malformed_last_row(self):
+        self.write_visit(weight="x", deposit=True, duration="soon", cat="someone_else", conf=50)
+        gs = gwmod.GatewayState(self.visits, cats=[("cat_a", 3.2), ("cat_b", 4.6)],
+                                cats_file=os.path.join(self.dir, "cats.json"))
+        for key in ("last_visit_weight", "last_deposit_weight", "last_visit_duration", "last_visit_cat"):
+            self.assertNotIn(key, gs.state)
 
 
 class HaBridgeResilienceTests(unittest.TestCase):

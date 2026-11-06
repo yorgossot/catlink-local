@@ -16,7 +16,7 @@ is authoritative.
 
 "measurement" in the tables below means the discovery config sets `state_class: measurement`, so Home
 Assistant keeps long-term statistics (history graphs beyond the recorder window) for that sensor. It is set
-only on numeric readings: the weights, the deposit, the live scale and the Wi-Fi signal; never on counters
+only on numeric readings: the weights, the deposit, the live scale, the litter weight and the Wi-Fi signal; never on counters
 or text.
 
 ## MQTT topics
@@ -68,6 +68,7 @@ topic write homeassistant/+/catlink_litterbox/#
 | sensor | visit_count | Visit counter | `sensor.catlink_open_x_visit_counter` | json_attributes from `BASE/visits` |
 | sensor | box_clock | Box clock | `sensor.catlink_open_x_box_clock` | `HH:MM`, diagnostic |
 | sensor | live_scale | Live scale | `sensor.catlink_open_x_live_scale` | weight, kg, measurement, diagnostic |
+| sensor | litter_weight | Litter weight | `sensor.catlink_open_x_litter_weight` | weight, kg, measurement; unknown for the first few minutes |
 | sensor | slot_count | Schedule slot count | `sensor.catlink_open_x_schedule_slot_count` | diagnostic |
 | sensor | unmapped_bytes | Unmapped heartbeat bytes | `sensor.catlink_open_x_unmapped_heartbeat_bytes` | diagnostic, from `BASE/diag` |
 | sensor | unmapped_changed_at | Unmapped bytes changed | `sensor.catlink_open_x_unmapped_bytes_changed` | diagnostic, from `BASE/diag` |
@@ -141,6 +142,7 @@ Because the weight sensors carry `BASE/state` as attributes, a dashboard can rea
 | burial_minutes | int | |
 | visit_count | int | resets to 0 when the drawer is put back |
 | live_scale | float | kg |
+| litter_weight | float | kg, median of the last 5 trusted empty-scale readings; absent until 3 exist |
 | slot_count | int | |
 | bin_full | bool | |
 | drawer_out | bool | true = out |

@@ -111,6 +111,8 @@ DEPOSIT_NOISE_FLOOR_G = 30       # g: a computed deposit below this is at/under 
 RELITTER_CONFIRM_SAMPLES = 3     # a higher empty level is adopted as the baseline only after this many
 RELITTER_TOLERANCE_KG = 0.10     # consecutive idle+unoccupied heartbeats agree within this (a real litter
                                  # top-up persists; a one-off cat-on-scale lag reading does not).
+LITTER_WEIGHT_SAMPLES = 5        # litter_weight = median of the last N trusted empty baselines ...
+LITTER_WEIGHT_MIN_SAMPLES = 3    # ... published once at least this many exist (a few minutes after start)
 MIN_SETTLED_SAMPLES = 2          # settled visit weight = MEDIAN of the genuine cat-on-scale samples (robust
                                  # to a partial-support low sample); fall back to the box peak below this.
 
@@ -208,7 +210,8 @@ class GatewayState:
         self._occupied_samples = []           # genuine cat-on-scale readings this visit (settled = median)
         self._high_candidate = None           # a sustained higher empty level under confirmation, kg
         self._high_count = 0                  # consecutive idle+unoccupied readings agreeing with it
-        self._pending_visit = None            # {time, peak, duration} captured at the visit report
+        self._litter_hist = collections.deque(maxlen=LITTER_WEIGHT_SAMPLES)  # recent trusted baselines, kg
+        self._pending_visit = None           # {time, peak, duration} captured at the visit report
         self.recent_visits = collections.deque(maxlen=VISITS_KEEP)  # oldest -> newest
         self._load_visits()
         # Cat identification + weight tracking (pure analysis of the settled weight; see cats.py).
@@ -216,6 +219,28 @@ class GatewayState:
         self.cats = CatTracker(cats, cats_file) if cats else None
         if self.cats is not None:
             self.state.update(self.cats._fields())   # seed the cat sensors before the first visit
+        self._restore_last_visit()
+
+    def _restore_last_visit(self):
+        """Seed the last-visit sensors from the persisted visit log, so a restart republishes the real
+        last visit instead of leaving HA with whatever it held before (or nothing). Best-effort."""
+        last = self.recent_visits[-1] if self.recent_visits else None
+        if not isinstance(last, dict):
+            return
+        try:
+            if isinstance(last.get("weight"), (int, float)) and not isinstance(last.get("weight"), bool):
+                self.state["last_visit_weight"] = last["weight"]
+            if isinstance(last.get("deposit"), int) and not isinstance(last.get("deposit"), bool):
+                self.state["last_deposit_weight"] = last["deposit"]
+            match = re.match(r"^(\d+)m (\d+)s$", str(last.get("duration", "")))
+            if match:
+                mm, ss = int(match.group(1)), int(match.group(2))
+                self.state["last_visit_duration"] = "%d:%02d" % (mm, ss)
+                self.state["last_visit_seconds"] = mm * 60 + ss
+            if self.cats is not None and last.get("cat") in self.cats.CATS + ("unknown",):
+                self.state.update(self.cats._fields(last_cat=last["cat"], last_conf=int(last.get("conf", 0))))
+        except (TypeError, ValueError):
+            pass
 
     def _touch(self):
         self.dirty.set()
@@ -365,6 +390,13 @@ class GatewayState:
                     self._empty_baseline = scale
                     self._high_candidate = None
                     self._high_count = 0
+            # Litter weight = median of the last few TRUSTED empty baselines (idle, unoccupied; a one-off
+            # high lag reading is already rejected above, the median rides out a one-off low one). The box
+            # has no litter-level sensor; HA derives "litter low" from this (see docs/DESIGN.md).
+            if self._empty_baseline is not None:
+                self._litter_hist.append(self._empty_baseline)
+                if len(self._litter_hist) >= LITTER_WEIGHT_MIN_SAMPLES:
+                    self.state["litter_weight"] = round(statistics.median(self._litter_hist), 2)
         self._prev_occupied = occupied
 
     def _load_visits(self):
@@ -860,6 +892,10 @@ def sensor_discovery():
         _sensor("box_clock", "Box clock", "{{ value_json.box_clock }}", diagnostic=True),
         _sensor("live_scale", "Live scale", "{{ value_json.live_scale }}", device_class="weight", unit="kg",
                 diagnostic=True, measurement=True),
+        # Litter in the drum: median of recent trusted empty-scale readings. Absent from the state until
+        # enough readings exist (HA shows unknown). The "litter low" threshold lives in HA.
+        _sensor("litter_weight", "Litter weight", "{{ value_json.litter_weight | default(none) }}",
+                device_class="weight", unit="kg", icon="mdi:weight", measurement=True),
         # --- diagnostics for retrospective / live mapping of not-yet-decoded signals ---
         _sensor("slot_count", "Schedule slot count", "{{ value_json.slot_count }}", diagnostic=True),
         _sensor("unmapped_bytes", "Unmapped heartbeat bytes", "{{ value_json.unmapped_bytes }}",

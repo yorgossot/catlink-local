@@ -1,0 +1,77 @@
+# "Litter low" alarm. The box has no litter-level sensor (see docs/DESIGN.md, "Litter weight and
+# 'litter low'"), so this compares the gateway's Litter weight sensor with a threshold you set.
+#
+# This is a Home Assistant package: put it in a packages folder, e.g. in configuration.yaml
+#   homeassistant:
+#     packages: !include_dir_named packages
+# and save this file as packages/catlink_litter_low.yaml. Then restart Home Assistant.
+#
+# Entity ids below assume the default CATLINK_DEVICE_NAME ("CATLINK Open X"). They are minted by Home
+# Assistant from the device name, so check yours in Settings -> Devices & services -> Entities.
+# Works in sensor-only mode (CATLINK_COMMANDS=0).
+#
+# Choosing the threshold: fill the drum to MAX, level it, and read sensor.catlink_open_x_litter_weight once
+# it appears (a few minutes). Set input_number.catlink_litter_low_kg to about half of that from any
+# dashboard; Home Assistant keeps the value across restarts. Until you set it, it sits at its minimum
+# (0.3 kg), so the alarm stays quiet.
+#
+# How it behaves:
+# - on after the litter weight has been below the threshold for 20 minutes;
+# - off once it is back above threshold + 0.2 kg for 5 minutes (no flicker around the threshold);
+# - holds its state while the weight is unknown (gateway restart, box offline);
+# - notifies once per low spell: only a real off -> on change, after at least 30 minutes off.
+
+input_number:
+  catlink_litter_low_kg:
+    name: Litter low below
+    min: 0.3
+    max: 6
+    step: 0.05
+    unit_of_measurement: kg
+    mode: box
+    icon: mdi:tray-alert
+
+template:
+  - binary_sensor:
+      - name: CATLINK litter low
+        unique_id: catlink_litter_low
+        device_class: problem
+        icon: mdi:tray-alert
+        delay_on: "00:20:00"
+        delay_off: "00:05:00"
+        state: >-
+          {% set w = states('sensor.catlink_open_x_litter_weight') %}
+          {% set t = states('input_number.catlink_litter_low_kg') | float(0) %}
+          {% if is_number(w) and t > 0 %}
+            {{ (w | float < t) if this.state != 'on' else (w | float < t + 0.2) }}
+          {% else %}
+            {{ this.state == 'on' }}
+          {% endif %}
+
+automation:
+  - id: catlink_litter_low
+    alias: 'CATLINK: litter low'
+    description: >-
+      Notify when the litter box is low on litter (20 min below the threshold, after at least 30 min off).
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.catlink_litter_low
+        from: 'off'
+        to: 'on'
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ (trigger.to_state.last_changed - trigger.from_state.last_changed).total_seconds() >= 1800 }}
+    actions:
+      - action: persistent_notification.create
+        data:
+          notification_id: catlink_litter_low
+          title: Litter box
+          message: >-
+            Low on litter ({{ states('sensor.catlink_open_x_litter_weight') }} kg). Top it up and level it.
+      # Or a push to your phone (the service name depends on your companion app):
+      # - action: notify.mobile_app_<your_phone>
+      #   data:
+      #     title: Litter box
+      #     message: Low on litter. Top it up and level it.

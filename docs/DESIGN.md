@@ -91,7 +91,7 @@ it also flips to `offline` when no fresh heartbeat has arrived for `OFFLINE_AFTE
 The decoder is table-driven (`HEARTBEAT_FIELDS`). Bytes not covered by the table are published on
 `BASE/diag` (`unmapped_bytes`, `unmapped_changed_at`, `unmapped_change_count`), and any frame with an
 unknown command appears as `last_unknown_frame`. Every box PUBLISH is logged with its full hex in the
-journal, so an event can be mapped later from history. Signals not yet identified (deodorant, litter low,
+journal, so an event can be mapped later from history. Signals not yet identified (deodorant,
 error, child-lock and kitty readback) are not exposed at all rather than guessed.
 
 ## Visit weight and deposit
@@ -105,6 +105,26 @@ error, child-lock and kitty readback) are not exposed at all rather than guessed
   after topping up litter is adopted after 3 consecutive readings agree within 0.10 kg.
 - The **deposit** is the baseline shift across the visit; under 30 g it reads 0.
 - `recent_visits` keeps the last 15 visits, persisted in `visits.jsonl` under the state directory.
+- On start the last-visit sensors (weight, duration, deposit and, with cats, the label) are restored from
+  the last `visits.jsonl` row, so a restart does not leave Home Assistant showing a stale value.
+
+## Litter weight and "litter low"
+
+The box has **no litter-level sensor**. In a test, litter was taken out until the empty scale went from
+about 3.3 kg to 0.7 kg, and the box sent nothing new: no flag, no unknown frame, no changed unmapped byte.
+The vendor app's "litter not enough" notice is therefore computed in the cloud, most likely from the same
+scale weight and the configured litter type.
+
+The empty scale reads the litter in the drum almost directly (a freshly filled box read about 3.2–3.3 kg,
+which matches the drum's volume times the litter's density). So the gateway publishes `litter_weight`: the
+median of the last 5 trusted empty baselines (the guards above already reject a cat on the scale and
+mid-cycle readings; the median rides out a single low one). It appears after 3 readings.
+
+The threshold depends on your litter, so it lives in Home Assistant, not in the gateway. As a starting
+point: the Open X is sold as holding about 4 L to the MAX line (retailer listings; no official figure was
+found). Bentonite clumping litter is roughly 0.8–1.0 kg/L, so a full drum is about 3.2–4 kg;
+plant-based and wood litters weigh much less. Fill to MAX, wait for `litter_weight`, and set the alarm at about half
+of that. See [examples/homeassistant/litter_low.yaml](../examples/homeassistant/litter_low.yaml).
 
 ## Cat identification (optional, `CATLINK_CATS`)
 

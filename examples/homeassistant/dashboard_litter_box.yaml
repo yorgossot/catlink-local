@@ -37,6 +37,14 @@ views:
       {%- elif b == 'off' -%}Waste bin: not full
       {%- else -%}Waste bin: unknown{%- endif -%}
       {%- if is_state('binary_sensor.catlink_open_x_waste_drawer', 'on') %} · **waste drawer is out**{% endif -%}
+  # Litter: the gateway's litter weight. The "low" line needs examples/homeassistant/litter_low.yaml; without
+  # it only the weight shows.
+  - type: markdown
+    content: >-
+      {%- set w = states('sensor.catlink_open_x_litter_weight') -%}
+      {%- if not is_number(w) -%}Litter: measuring…
+      {%- elif is_state('binary_sensor.catlink_litter_low', 'on') -%}**⚠ Low on litter ({{ w }} kg) — top it up and level it.**
+      {%- else -%}Litter: {{ w }} kg{%- endif -%}
   - type: grid
     columns: 2
     square: false

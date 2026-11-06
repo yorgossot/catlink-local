@@ -38,6 +38,8 @@ What works:
 - heartbeat decode: state, occupancy, live scale, mode, litter type, settings, box clock, Wi-Fi RSSI
 - visits: count, duration, weight (box value and a settled estimate), deposit estimate
 - waste bin full, waste drawer out
+- litter weight in the drum, and an example "litter low" alarm built on it (the box itself has no
+  litter-level sensor; [examples/homeassistant/litter_low.yaml](examples/homeassistant/litter_low.yaml))
 - commands (off by default): clean, level, pause, resume, cancel; mode (automatic/manual), litter type,
   clean delay, burial delay, light, sound, continuous cleaning, soft-stool burial, child lock, kitty mode
 - optional weight-based labelling of visits for one or two cats (off by default)
@@ -48,7 +50,7 @@ What does not:
 - the box clock is never set; it was hours off on the tested box, so the box's own schedule and night
   hours run on the wrong time
 - child lock and kitty mode have no readback (switches are optimistic)
-- deodorant level, litter low and error/anti-pinch are not mapped
+- deodorant level and error/anti-pinch are not mapped
 - the box does not clean after a visit on its own once it is off the cloud; an example HA automation
   does it instead ([examples/homeassistant/automation_auto_clean.yaml](examples/homeassistant/automation_auto_clean.yaml))
 - the vendor's cloud features ("AI", app history) are gone, and **the vendor app cannot reach the box**
