@@ -348,7 +348,8 @@ class GatewayState:
                 if self._pending_visit is not None:
                     record = dict(self._pending_visit)
                     peak = record.get("peak")
-                    if len(self._occupied_samples) >= MIN_SETTLED_SAMPLES:
+                    is_settled = len(self._occupied_samples) >= MIN_SETTLED_SAMPLES
+                    if is_settled:
                         settled = round(statistics.median(self._occupied_samples) - self._pre_visit_baseline, 2)
                         if settled < 0:
                             settled = 0.0
@@ -362,7 +363,7 @@ class GatewayState:
                     # reach the box side (defensive try/except around all of it).
                     if self.cats is not None:
                         try:
-                            self.state.update(self.cats.on_visit(settled, record))
+                            self.state.update(self.cats.on_visit(settled, record, settled=is_settled))
                             self.cats.save()
                         except Exception as exc:  # pragma: no cover - defensive
                             log("cat_label_error", error=type(exc).__name__)

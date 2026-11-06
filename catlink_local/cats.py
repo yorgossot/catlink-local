@@ -20,13 +20,13 @@ from .log import log
 CAT_UNKNOWN_BAND = 0.06         # kg: a settled weight within midpoint ± this is too ambiguous -> "unknown"
 CAT_GAP_FLOOR = 0.15            # kg: references closer than this => "degraded"; re-fit never crosses them
 CAT_SIGMA = 0.07                # kg: gaussian width for the confidence % (≈ the scale noise)
-CAT_PAIR_WINDOW_S = 900         # 15 min: two completed visits within this are DIFFERENT cats (joint assign) ...
-CAT_PAIR_MIN_DIFF = 0.10        # ... but only if their settled weights differ by at least this (kg). A cat often
-                                # re-enters a few times in a row at the same weight; pairing those would split
-                                # one cat's visits between both cats and drive the tracker into "degraded".
+CAT_UNSETTLED_BAND_FACTOR = 2   # a visit too short for a settled weight (the box max-hold peak stands in) gets
+                                # this x the unknown band and never becomes a weight sample. There is no timing
+                                # rule: an earlier "two visits within 15 min are different cats" rule kept
+                                # mislabelling one cat coming back several times in a row.
 CAT_WINDOW_DAYS = 14            # tracked weight = median of confident visits within this rolling window ...
 CAT_WINDOW_MAX = 10             # ... and at most this many most-recent confident visits per cat
-CAT_JOINT_CONF = 95             # confidence stamped on a 15-min joint assignment / a manual correction
+CAT_JOINT_CONF = 95             # confidence stamped on a manual correction
 CAT_TREND_DEADBAND_G = 20       # |7-day change| at/under this reads as "steady"
 CAT_SINGLE_CONF = 100           # confidence stamped on every visit when exactly one cat is configured
 SET_REF_MIN_KG = 0.2            # sanity bound on a manual weigh-in (kg); out of range is ignored
@@ -49,12 +49,10 @@ class CatTracker:
     Rules with two cats (see docs/DESIGN.md):
       * Classify by gaussian likelihood (σ≈70 g) to the two references, with an UNKNOWN band: a weight
         within midpoint ± CAT_UNKNOWN_BAND, or while "degraded" (references within CAT_GAP_FLOOR), is
-        "unknown". Otherwise the nearer cat, with a confidence % from the likelihood ratio.
-      * 15-MIN RULE: two completed visits within CAT_PAIR_WINDOW_S whose settled weights differ by at
-        least CAT_PAIR_MIN_DIFF are DIFFERENT cats and are assigned jointly by weight (heavier -> the
-        heavier cat, lighter -> the lighter cat), overriding the per-visit guess and raising confidence.
-        This is relative, so it still works while degraded (and helps recover). Closer weights are
-        probably the same cat re-entering: no pairing, each visit is classified on its own.
+        "unknown". Otherwise the nearer cat, with a confidence % from the likelihood ratio. Each visit is
+        classified on its own weight only; no timing or alternation assumption (cats do whatever).
+      * A visit too short for a settled weight (the box's max-hold peak stands in) is less certain: it
+        gets CAT_UNSETTLED_BAND_FACTOR x the unknown band and is never added as a weight sample.
       * Tracked weight = MEDIAN of that cat's confident visits in the rolling window (NOT an EMA, NOT
         the last reading). A 7-day trend and the current gap are derived from the same samples.
       * References update ONLY from (a) a confident rolling re-fit to the per-cat medians, which keeps
@@ -82,12 +80,13 @@ class CatTracker:
         self.total_visits = 0
         self.labelled_visits = 0
         self.degraded = False
-        self._last = None   # most-recent finalized visit: {"at","cat","w","sample","record"} (for the 15-min rule)
+        self._last = None   # most-recent finalized visit: {"at","cat","w","sample","record","settled"} (correct_last)
         self._load()
 
     # ---- classification -----------------------------------------------------------------------
-    def _classify(self, w):
-        """Return (cat, conf_pct, confident) for a settled weight w (kg). Two cats only."""
+    def _classify(self, w, band=CAT_UNKNOWN_BAND):
+        """Return (cat, conf_pct, confident) for a weight w (kg); within midpoint ± band -> unknown.
+        Two cats only."""
         lo, hi = self.refs[self.lo], self.refs[self.hi]
         mid = (lo + hi) / 2.0
         dt, ds = w - lo, w - hi
@@ -99,7 +98,7 @@ class CatTracker:
         else:
             nearer = self.lo if pt >= ps else self.hi
             conf = int(round(100 * max(pt, ps) / total))
-        if self.degraded or abs(w - mid) <= CAT_UNKNOWN_BAND:
+        if self.degraded or abs(w - mid) <= band + 1e-9:
             return "unknown", conf, False
         return nearer, conf, True
 
@@ -167,42 +166,38 @@ class CatTracker:
         self.degraded = (self.refs[hi] - self.refs[lo]) < CAT_GAP_FLOOR
 
     # ---- the per-visit entry point ------------------------------------------------------------
-    def on_visit(self, w, record, now=None):
+    def on_visit(self, w, record, now=None, settled=True):
         """Finalize a completed visit's cat label. `record` is the recent_visits row, mutated in place to
-        carry 'cat' + 'conf'. Returns the state fields to publish. `now` is injectable for offline tests."""
+        carry 'cat' + 'conf'. `settled` is False when w is the box max-hold peak (too few cat-on-scale
+        heartbeats). Returns the state fields to publish. `now` is injectable for offline tests."""
         now = time.time() if now is None else now
         self.total_visits += 1
         if not self.pair:
             cat, conf, confident = self.lo, CAT_SINGLE_CONF, True
         else:
-            cat, conf, confident = self._classify(w)
-            if (self._last is not None and 0 <= (now - self._last["at"]) <= CAT_PAIR_WINDOW_S
-                    and abs(w - self._last["w"]) >= CAT_PAIR_MIN_DIFF - 1e-9):
-                prev = self._last
-                cat, prev_cat = (self.hi, self.lo) if w >= prev["w"] else (self.lo, self.hi)
-                conf, confident = CAT_JOINT_CONF, True
-                if prev["cat"] != prev_cat:
-                    self._relabel(prev, prev_cat)
+            band = CAT_UNKNOWN_BAND * (1 if settled else CAT_UNSETTLED_BAND_FACTOR)
+            cat, conf, confident = self._classify(w, band)
         record["cat"] = cat
         record["conf"] = conf
         sample = None
         if confident:
-            sample = self._add_sample(cat, w, now)
             self.labelled_visits += 1
-            self._refit()
-        self._last = {"at": now, "cat": cat, "w": w, "sample": sample, "record": record}
+            if settled:
+                sample = self._add_sample(cat, w, now)
+                self._refit()
+        self._last = {"at": now, "cat": cat, "w": w, "sample": sample, "record": record, "settled": settled}
         return self._fields(last_cat=cat, last_conf=conf)
 
     def _relabel(self, prev, target):
-        """Move a previous visit's confident sample to `target` (15-min rule and corrections). If it had
-        no sample (was unknown) it gains one now. Re-fits afterwards."""
+        """Move a previous visit to `target` (manual correction). Its sample moves with it; a visit that
+        had none gains one now, unless its weight was an unsettled box peak. Re-fits afterwards."""
         old = prev["cat"]
         if prev["sample"] is not None and old in self.samples and prev["sample"] in self.samples[old]:
             self.samples[old].remove(prev["sample"])
-        else:
+        if old not in self.CATS:
             self.labelled_visits += 1
         t = prev["sample"]["t"] if prev["sample"] else time.time()
-        prev["sample"] = self._add_sample(target, prev["w"], t)
+        prev["sample"] = self._add_sample(target, prev["w"], t) if prev.get("settled", True) else None
         prev["cat"], prev["conf"] = target, CAT_JOINT_CONF
         if prev.get("record") is not None:
             prev["record"]["cat"], prev["record"]["conf"] = target, CAT_JOINT_CONF
@@ -217,7 +212,8 @@ class CatTracker:
             return None
         self._relabel(self._last, cat)
         self.correction_count += 1
-        self._anchor_ref(cat, statistics.median([s["w"] for s in self.samples[cat]]))
+        if self.samples[cat]:
+            self._anchor_ref(cat, statistics.median([s["w"] for s in self.samples[cat]]))
         return self._fields(last_cat=self._last["cat"], last_conf=self._last["conf"])
 
     def set_ref(self, cat, payload):

@@ -1,6 +1,6 @@
 """CatTracker unit tests (0, 1 and 2 configured cats) and CATLINK_CATS parsing.
 
-Deterministic and in-process: temp state files, `now` injected so the 15-min window is deterministic.
+Deterministic and in-process: temp state files, `now` injected so the rolling window is deterministic.
 Seeds and weights are synthetic.
 """
 import json
@@ -60,13 +60,33 @@ class TwoCatTests(TrackerCase):
         t.on_visit(3.91, r, now=self.T0 + 4000)   # refs now 3.18 / 4.65, mid 3.915
         self.assertEqual(r["cat"], "unknown")
 
-    def test_fifteen_minute_rule(self):
+    def test_no_timing_rule(self):
+        # Visits close together are each classified on their own weight; an earlier visit is never relabelled.
         t = self.tracker()
         r1, r2 = {}, {}
-        t.on_visit(3.87, r1, now=self.T0)          # inside the unknown band on its own
-        t.on_visit(3.97, r2, now=self.T0 + 300)    # 5 min later, 100 g heavier: a different cat
-        self.assertEqual((r2["cat"], r2["conf"]), ("cat_b", c.CAT_JOINT_CONF))
-        self.assertEqual((r1["cat"], r1["conf"]), ("cat_a", c.CAT_JOINT_CONF))
+        t.on_visit(3.87, r1, now=self.T0)          # inside the unknown band (mid 3.90 ± 0.06)
+        t.on_visit(3.97, r2, now=self.T0 + 300)    # 5 min later, just outside the band
+        self.assertEqual(r1["cat"], "unknown")
+        self.assertEqual(r2["cat"], "cat_b")
+        self.assertEqual(t.samples["cat_a"], [])
+
+    def test_unsettled_weight_is_less_certain(self):
+        # A visit too short for a settled weight (the box peak stands in): twice the unknown band, no sample.
+        t = self.tracker()
+        r1, r2 = {}, {}
+        t.on_visit(4.00, r1, now=self.T0, settled=False)        # 100 g past mid: unknown when unsettled
+        t.on_visit(4.70, r2, now=self.T0 + 60, settled=False)   # clearly cat_b: labelled, but no sample
+        self.assertEqual(r1["cat"], "unknown")
+        self.assertEqual(r2["cat"], "cat_b")
+        self.assertEqual((t.samples["cat_a"], t.samples["cat_b"]), ([], []))
+        self.assertEqual((t.refs["cat_a"], t.refs["cat_b"]), (3.20, 4.60))
+        self.assertEqual(t._fields()["labelled_pct"], 50)
+        t.correct_last("cat_a")                                  # relabelled, still no sample from a peak weight
+        self.assertEqual((r2["cat"], t.samples["cat_a"], t.correction_count), ("cat_a", [], 1))
+        self.assertEqual(t._fields()["labelled_pct"], 50)
+        r3 = {}
+        t.on_visit(4.00, r3, now=self.T0 + 120)                  # the same weight, settled: cat_b
+        self.assertEqual(r3["cat"], "cat_b")
 
     def test_same_weight_revisits_not_split(self):
         # One cat re-entering 4x in 10 min at the same weight must not be split between the cats.
@@ -181,7 +201,7 @@ class OneCatTests(TrackerCase):
         t = self.tracker(ONE)
         for i, w in enumerate((2.0, 3.3, 5.0)):
             r = {}
-            fields = t.on_visit(w, r, now=self.T0 + i * 60)   # even inside the 15-min window
+            fields = t.on_visit(w, r, now=self.T0 + i * 60)   # even minutes apart
             self.assertEqual((r["cat"], r["conf"]), ("cat_a", c.CAT_SINGLE_CONF))
             self.assertEqual(fields["last_visit_cat"], "Cat a 100%")
         self.assertEqual(t._fields()["labelled_pct"], 100)
