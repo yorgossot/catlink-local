@@ -180,7 +180,7 @@ class TwoCatTests(TrackerCase):
         t = self.tracker()
         fields = t.on_visit(3.90, {}, now=self.T0)
         self.assertEqual(fields["last_cat"], "unknown")
-        self.assertTrue(fields["last_visit_cat"].startswith("Unknown "))
+        self.assertEqual(fields["last_visit_cat"], "Unknown")   # no %: it was the nearer cat's share
         self.assertEqual(fields["labelled_pct"], 0)
 
     def test_trend_words(self):
@@ -194,6 +194,57 @@ class TwoCatTests(TrackerCase):
         t.samples["cat_a"] = [{"t": now - 10 * 86400, "w": 3.20}, {"t": now - 86400, "w": 3.25}]
         self.assertEqual(t._trend("cat_a"), 50)
         self.assertEqual(t._fields()["cat_a_trend_word"], "gaining")
+
+
+class PlausibilityTests(TrackerCase):
+    """A weight that is not one whole cat (paws only, a cat on a turning drum, two cats at once) and a visit
+    that overlapped a clean cycle are unknown and never weight samples."""
+
+    def confirmed(self):
+        t = self.tracker()
+        for i, w in enumerate((3.20, 4.60)):
+            t.on_visit(w, {}, now=self.T0 + i)              # both references now have samples
+        return t
+
+    def test_far_outside_both_cats_is_unknown(self):
+        t = self.confirmed()
+        labels = {}
+        for w in (2.30, 1.50, 5.20, 7.80):
+            r = {}
+            t.on_visit(w, r, now=self.T0 + 10)
+            labels[w] = r["cat"]
+        self.assertEqual(set(labels.values()), {"unknown"}, labels)
+        self.assertEqual([len(t.samples[k]) for k in ("cat_a", "cat_b")], [1, 1])
+        r = {}
+        t.on_visit(2.95, r, now=self.T0 + 20)                # within 0.30 kg of cat_a: still cat_a
+        self.assertEqual(r["cat"], "cat_a")
+
+    def test_correcting_an_implausible_visit_adds_no_sample(self):
+        t = self.confirmed()
+        t.on_visit(1.50, {}, now=self.T0 + 10)
+        t.correct_last("cat_a")
+        self.assertEqual(len(t.samples["cat_a"]), 1)
+
+    def test_seed_only_references_do_not_gate(self):
+        t = self.tracker()                                   # rough seeds 3.20 / 4.60, no samples yet
+        r = {}
+        t.on_visit(2.60, r, now=self.T0)                     # 0.60 kg under the seed: the seed was wrong
+        self.assertEqual(r["cat"], "cat_a")
+        self.assertEqual(len(t.samples["cat_a"]), 1)
+
+    def test_orphan_visit_is_unknown(self):
+        t = self.confirmed()
+        r = {}
+        t.on_visit(4.60, r, now=self.T0 + 10, orphan=True)   # a perfect weight, but during a clean cycle
+        self.assertEqual((r["cat"], len(t.samples["cat_b"])), ("unknown", 1))
+
+    def test_one_cat_odd_weight_is_the_cat_but_no_sample(self):
+        t = self.tracker(ONE)
+        t.on_visit(3.10, {}, now=self.T0)
+        r = {}
+        t.on_visit(1.20, r, now=self.T0 + 60)
+        self.assertEqual(r["cat"], "cat_a")
+        self.assertEqual([s["w"] for s in t.samples["cat_a"]], [3.10])
 
 
 class OneCatTests(TrackerCase):

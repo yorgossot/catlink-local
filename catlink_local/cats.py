@@ -24,6 +24,10 @@ CAT_UNSETTLED_BAND_FACTOR = 2   # a visit too short for a settled weight (the bo
                                 # this x the unknown band and never becomes a weight sample. There is no timing
                                 # rule: an earlier "two visits within 15 min are different cats" rule kept
                                 # mislabelling one cat coming back several times in a row.
+CAT_PLAUSIBLE_MARGIN = 0.30     # kg: a weight more than this below the lightest confirmed reference or above the
+                                # heaviest is not one whole cat (paws only, a cat on a turning drum, two cats at
+                                # once) -> "unknown", never a sample. A reference counts as confirmed once it has
+                                # weight samples, so rough seed weights cannot lock every visit out.
 CAT_WINDOW_DAYS = 14            # tracked weight = median of confident visits within this rolling window ...
 CAT_WINDOW_MAX = 10             # ... and at most this many most-recent confident visits per cat
 CAT_JOINT_CONF = 95             # confidence stamped on a manual correction
@@ -53,6 +57,9 @@ class CatTracker:
         classified on its own weight only; no timing or alternation assumption (cats do whatever).
       * A visit too short for a settled weight (the box's max-hold peak stands in) is less certain: it
         gets CAT_UNSETTLED_BAND_FACTOR x the unknown band and is never added as a weight sample.
+      * A weight more than CAT_PLAUSIBLE_MARGIN outside the confirmed references is not one whole cat, and
+        a visit that overlapped a clean cycle (`orphan`) has no usable weight: both are "unknown" and
+        never samples. With one cat such a visit is still that cat, just not a weight sample.
       * Tracked weight = MEDIAN of that cat's confident visits in the rolling window (NOT an EMA, NOT
         the last reading). A 7-day trend and the current gap are derived from the same samples.
       * References update ONLY from (a) a confident rolling re-fit to the per-cat medians, which keeps
@@ -166,14 +173,26 @@ class CatTracker:
         self.degraded = (self.refs[hi] - self.refs[lo]) < CAT_GAP_FLOOR
 
     # ---- the per-visit entry point ------------------------------------------------------------
-    def on_visit(self, w, record, now=None, settled=True):
+    def _plausible(self, w):
+        """False if w is more than CAT_PLAUSIBLE_MARGIN outside the references that have samples."""
+        lo_ok = not self.samples[self.lo] or w >= self.refs[self.lo] - CAT_PLAUSIBLE_MARGIN - 1e-9
+        top = self.hi if self.pair else self.lo
+        hi_ok = not self.samples[top] or w <= self.refs[top] + CAT_PLAUSIBLE_MARGIN + 1e-9
+        return lo_ok and hi_ok
+
+    def on_visit(self, w, record, now=None, settled=True, orphan=False):
         """Finalize a completed visit's cat label. `record` is the recent_visits row, mutated in place to
         carry 'cat' + 'conf'. `settled` is False when w is the box max-hold peak (too few cat-on-scale
-        heartbeats). Returns the state fields to publish. `now` is injectable for offline tests."""
+        heartbeats). `orphan` is True when the visit overlapped a clean cycle (a cat stepping into a
+        running cycle), so its weight is not one whole cat. Returns the state fields to publish. `now`
+        is injectable for offline tests."""
         now = time.time() if now is None else now
         self.total_visits += 1
-        if not self.pair:
+        plausible = not orphan and self._plausible(w)
+        if not self.pair:                      # one cat: always that cat; an odd weight is just no sample
             cat, conf, confident = self.lo, CAT_SINGLE_CONF, True
+        elif not plausible:
+            cat, conf, confident = "unknown", 0, False
         else:
             band = CAT_UNKNOWN_BAND * (1 if settled else CAT_UNSETTLED_BAND_FACTOR)
             cat, conf, confident = self._classify(w, band)
@@ -182,10 +201,12 @@ class CatTracker:
         sample = None
         if confident:
             self.labelled_visits += 1
-            if settled:
+            if settled and plausible:
                 sample = self._add_sample(cat, w, now)
                 self._refit()
-        self._last = {"at": now, "cat": cat, "w": w, "sample": sample, "record": record, "settled": settled}
+        # "settled" here = the weight may ever become a sample (also via a manual correction).
+        self._last = {"at": now, "cat": cat, "w": w, "sample": sample, "record": record,
+                      "settled": settled and plausible}
         return self._fields(last_cat=cat, last_conf=conf)
 
     def _relabel(self, prev, target):
@@ -252,7 +273,8 @@ class CatTracker:
             name = "Unknown" if last_cat == "unknown" else display_name(last_cat)
             fields["last_cat"] = last_cat
             fields["last_conf"] = last_conf
-            fields["last_visit_cat"] = "%s %d%%" % (name, last_conf)
+            # The % of an unknown visit is the nearer cat's share, which reads as "95% sure of nothing".
+            fields["last_visit_cat"] = name if last_cat == "unknown" else "%s %d%%" % (name, last_conf)
         return fields
 
     # ---- persistence --------------------------------------------------------------------------

@@ -359,19 +359,19 @@ class GatewayScenarioTests(unittest.TestCase):
             else:
                 check("NO actuators in sensor mode", not (ACTUATOR_COMPONENTS & components), sorted(components))
                 # stale command entities from an earlier CATLINK_COMMANDS=1 run are removed: an empty
-                # retained payload on each of the 15 command discovery topics
+                # retained payload on each of the 16 command discovery topics
                 cleared = sink.cleared()
                 cleared_ids = {t.split("/")[1] + "/" + t.split("/")[3] for t, _ in cleared}
                 expected = {"button/clean", "button/pause", "button/resume", "button/cancel", "button/level",
                             "select/mode", "select/litter_type", "number/clean_delay", "number/burial_minutes",
                             "switch/light", "switch/sound", "switch/continuous", "switch/burial",
-                            "switch/child_lock", "switch/kitty"}
-                check("sensor mode clears the 15 command discovery topics (retained, empty)",
-                      cleared_ids == expected and len(cleared) == 15 and all(r for _, r in cleared)
+                            "switch/child_lock", "switch/kitty", "button/litter_reset"}
+                check("sensor mode clears the 16 command discovery topics (retained, empty)",
+                      cleared_ids == expected and len(cleared) == 16 and all(r for _, r in cleared)
                       and all(t.startswith(PREFIX + "/") and t.split("/")[2] == NODE for t, _ in cleared),
                       sorted(cleared_ids ^ expected))
-                check("discovery log reports commands_cleared=15",
-                      published and published[0].get("commands_cleared") == 15, published[:1])
+                check("discovery log reports commands_cleared=16",
+                      published and published[0].get("commands_cleared") == 16, published[:1])
             unmapped_cfg = cfgs.get("sensor/unmapped_bytes", {})
             check("unmapped_bytes is diagnostic from BASE/diag",
                   unmapped_cfg.get("entity_category") == "diagnostic"
@@ -411,11 +411,12 @@ class GatewayScenarioTests(unittest.TestCase):
             if commands:
                 check("command mode subscribes BASE/+/set only", subs == [BASE + "/+/set"], subs)
             elif cats:
-                check("sensor mode with cats subscribes only the cat topics",
+                check("sensor mode with cats subscribes only the gateway-internal topics",
                       subs == sorted([BASE + "/correct_last/set", BASE + "/set_ref_cat_a/set",
-                                      BASE + "/set_ref_cat_b/set"]), subs)
+                                      BASE + "/set_ref_cat_b/set", BASE + "/litter_reset/set"]), subs)
             else:
-                check("sensor mode without cats subscribes nothing", subs == [], subs)
+                check("sensor mode without cats subscribes only the litter reset topic",
+                      subs == [BASE + "/litter_reset/set"], subs)
 
             # --- decode a heartbeat + a visit ---
             box.publish(v.HB_TOPIC, v.heartbeat(state=0, occ=0, touch=0, kg=1, cg=48, visit=4, extra=0))
@@ -746,6 +747,101 @@ class LitterWeightAndRestoreTests(unittest.TestCase):
                                 cats_file=os.path.join(self.dir, "cats.json"))
         for key in ("last_visit_weight", "last_deposit_weight", "last_visit_duration", "last_visit_cat"):
             self.assertNotIn(key, gs.state)
+
+
+class RezeroAndLateReportTests(unittest.TestCase):
+    """The box re-zeroes its scale at power-up with the litter in it; a visit report can arrive after
+    its occupancy closed (a cat stepped into a running clean cycle)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="catlink_gw_")
+        self.visits = os.path.join(self.dir, "visits.jsonl")
+        self.litter = os.path.join(self.dir, "litter.json")
+        logmod.configure(writer=lambda line: None)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def feed(self, gs, scale, occupied=False, state="idle"):
+        gs.state.update({"live_scale": scale, "occupied": occupied, "state": state})
+        gs._update_deposit()
+        return gs.state.get("litter_weight")
+
+    def test_power_up_rezero_is_carried_over(self):
+        gs = gwmod.GatewayState(self.visits, litter_file=self.litter)
+        for _ in range(3):
+            self.feed(gs, 3.30)
+        gs.on_box_session()                                    # power-cycle: new session, scale reads ~0
+        for _ in range(3):
+            self.feed(gs, 0.02)
+        self.assertEqual((gs.state["litter_weight"], gs._litter_offset), (3.30, 3.28))
+        for _ in range(6):
+            self.feed(gs, 0.32)                                # litter added on top after the re-zero
+        self.assertEqual(gs.state["litter_weight"], 3.60)
+        again = gwmod.GatewayState(self.visits, litter_file=self.litter)   # gateway restart
+        self.assertEqual((again.state["litter_weight"], again._litter_offset), (3.60, 3.28))
+
+    def test_reconnect_without_rezero_and_drop_within_a_session(self):
+        gs = gwmod.GatewayState(self.visits, litter_file=self.litter)
+        for _ in range(3):
+            self.feed(gs, 3.30)
+        gs.on_box_session()                                    # Wi-Fi reconnect: the zero did not move
+        for _ in range(3):
+            self.feed(gs, 3.30)
+        self.assertEqual((gs.state["litter_weight"], gs._litter_offset), (3.30, 0.0))
+        for _ in range(4):
+            self.feed(gs, 0.05)                                # litter removed within the session: real
+        self.assertEqual((gs.state["litter_weight"], gs._litter_offset), (0.05, 0.0))
+
+    def test_litter_reset_button(self):
+        gs = gwmod.GatewayState(self.visits, litter_file=self.litter)
+        for _ in range(3):
+            self.feed(gs, 3.30)
+        gs.on_box_session()
+        for _ in range(3):
+            self.feed(gs, 0.0)                                 # empty drum + power-cycle: carried over ...
+        saved = gwmod.GW
+        gwmod.GW = gs
+        try:
+            gwmod.handle_command("litter_reset", "PRESS")      # ... until the reset button drops it
+        finally:
+            gwmod.GW = saved
+        self.assertNotIn("litter_weight", gs.state)
+        for _ in range(3):
+            self.feed(gs, 0.0)
+        for _ in range(6):
+            self.feed(gs, 3.10)                                # refill reads true
+        self.assertEqual((gs.state["litter_weight"], gs._litter_offset), (3.10, 0.0))
+
+    def report(self, gs, mm, ss, kg, cg):
+        gs.on_visit(bytes([1, 3, mm, ss, kg, cg]))
+
+    def test_late_report_after_an_interrupted_cycle(self):
+        gs = gwmod.GatewayState(self.visits, cats=[("cat_a", 3.2), ("cat_b", 4.6)],
+                                cats_file=os.path.join(self.dir, "cats.json"))
+        for _ in range(3):
+            self.feed(gs, 0.10)
+        for scale in (3.30, 3.31, 3.30):
+            self.feed(gs, scale, occupied=True)
+        self.report(gs, 2, 0, 3, 45)                           # normal: reported while the visit is open
+        self.feed(gs, 0.14)
+        self.assertEqual([v["cat"] for v in gs.recent_visits], ["cat_a"])
+        self.feed(gs, 0.12, state="cleaning")
+        self.feed(gs, 1.20, occupied=True, state="interrupted")   # a cat steps into the running cycle
+        self.feed(gs, 1.05, state="cleaning")
+        self.feed(gs, 1.15)                                    # cycle done; no report yet
+        self.assertEqual(len(gs.recent_visits), 1)
+        self.report(gs, 0, 40, 0, 95)                          # the late report
+        last = gs.recent_visits[-1]
+        self.assertEqual((last["cat"], last["deposit"], last.get("during_clean")), ("unknown", 0, True))
+        self.assertEqual(gs.state["last_deposit_weight"], 0)
+        self.feed(gs, 4.60, occupied=True)                     # a later occupancy with no report of its own
+        self.feed(gs, 0.12)
+        self.assertEqual(len(gs.recent_visits), 2)             # the late report never attaches to it
+        self.assertEqual(len(gs.cats.samples["cat_b"]), 0)
+
+    def test_command_reply_is_a_known_frame(self):
+        self.assertIn(0x015A, gwmod.COMMAND_CODES)
 
 
 class HaBridgeResilienceTests(unittest.TestCase):

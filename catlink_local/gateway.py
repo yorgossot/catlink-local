@@ -81,6 +81,7 @@ PROTOCOLS = {(b"MQIsdp", 3), (b"MQTT", 4)}
 # Everything the box-side send() may ever write, by first byte. PUBLISH (0x30-0x3f) is NOT here:
 # publish_to_box() is its only path and it is gated on COMMANDS_ENABLED.
 ALLOWED_TX = {0x20: "connack", 0x40: "puback", 0x90: "suback", 0xD0: "pingresp"}
+COMMAND_CODES = frozenset(c.command for c in COMMANDS.values())   # the box echoes these as replies
 
 # Interlock thresholds (the safety envelope; deliberately not configurable). Movement commands
 # (clean/level/resume) act on the LATEST heartbeat, which can be stale; the box emits a steady ~100 s
@@ -115,6 +116,14 @@ LITTER_WEIGHT_SAMPLES = 5        # litter_weight = median of the last N trusted 
 LITTER_WEIGHT_MIN_SAMPLES = 3    # ... published once at least this many exist (a few minutes after start)
 MIN_SETTLED_SAMPLES = 2          # settled visit weight = MEDIAN of the genuine cat-on-scale samples (robust
                                  # to a partial-support low sample); fall back to the box peak below this.
+LATE_REPORT_GRACE_S = 180        # a visit report arriving this soon after its occupancy closed is paired with
+                                 # it (seen 40-50 s late when a cat stepped into a running clean cycle)
+# The box re-zeroes its scale at power-up WITH the litter in it (a power-cycle took the empty scale from
+# ~3.4 kg to 0.00). litter_weight therefore carries an offset across a re-zero: the first trusted empty
+# reading of a NEW box session that sits near 0 while the last known litter weight was substantial. Within
+# one session a low reading is never treated as a re-zero.
+LITTER_REZERO_MIN_PREV = 1.0     # kg: last known litter weight at/above this ...
+LITTER_REZERO_MAX_NOW = 0.30     # kg: ... and the new session's first empty reading at/under this = re-zero
 
 
 def configure(cfg):
@@ -134,8 +143,9 @@ def configure(cfg):
     STATE_TOPIC = BASE + "/state"
     DIAG_TOPIC = BASE + "/diag"
     VISITS_TOPIC = BASE + "/visits"      # json_attributes source for the visit_count sensor (recent_visits)
-    # Gateway-internal cat commands; they exist only when CATLINK_CATS is set and never reach the box.
+    # Gateway-internal commands; they never reach the box. The cat ones exist only when CATLINK_CATS is set.
     CAT_COMMANDS = ({"correct_last"} | {"set_ref_" + slug for slug, _ in cfg.cats}) if cfg.cats else set()
+    CAT_COMMANDS = CAT_COMMANDS | {"litter_reset"}
     configure_log(max_bytes=cfg.log_max_bytes)
 
 
@@ -192,8 +202,9 @@ def client_id_summary(client_id):
 class GatewayState:
     """One lock, one snapshot. The box threads write; the HA bridge reads. No MQTT from the box threads."""
 
-    def __init__(self, visits_file, cats=(), cats_file=None):
+    def __init__(self, visits_file, cats=(), cats_file=None, litter_file=None):
         self.visits_file = visits_file
+        self.litter_file = litter_file
         self.lock = threading.Lock()
         self.dirty = threading.Event()
         self.state = {}                      # HA-facing state dict
@@ -211,6 +222,14 @@ class GatewayState:
         self._high_candidate = None           # a sustained higher empty level under confirmation, kg
         self._high_count = 0                  # consecutive idle+unoccupied readings agreeing with it
         self._litter_hist = collections.deque(maxlen=LITTER_WEIGHT_SAMPLES)  # recent trusted baselines, kg
+        self._litter_offset = 0.0            # kg added to the raw empty scale after a power-up re-zero
+        self._litter_known = None            # last published litter_weight (persisted), kg
+        self._new_box_session = False
+        self._load_litter()
+        if self._litter_known is not None:
+            self.state["litter_weight"] = self._litter_known   # restart: no blank litter sensor
+        self._visit_saw_cycle = False        # this occupancy overlapped a clean cycle (state not idle)
+        self._closed_visit = None            # last closed occupancy awaiting a late box report
         self._pending_visit = None           # {time, peak, duration} captured at the visit report
         self.recent_visits = collections.deque(maxlen=VISITS_KEEP)  # oldest -> newest
         self._load_visits()
@@ -328,6 +347,11 @@ class GatewayState:
             self._pre_visit_baseline = self._empty_baseline
             self._visit_open = True
             self._occupied_samples = []
+            self._visit_saw_cycle = False
+        # A cat that steps into a running clean cycle shows up as occupancy while the box is not idle
+        # (interrupted / cleaning): the drum is turned, so the scale does not carry the whole cat.
+        if self._visit_open and not idle:
+            self._visit_saw_cycle = True
         # While occupied, collect every reading that is clearly a cat on the scale (above the baseline by
         # more than the lag/noise band). The settled weight is the MEDIAN of these, not the max-hold peak.
         if occupied and self._pre_visit_baseline is not None:
@@ -342,34 +366,23 @@ class GatewayState:
                     grams = 0
                 if grams < DEPOSIT_NOISE_FLOOR_G:      # at/under the 10 g scale noise floor -> none
                     grams = 0
+                if self._visit_saw_cycle:              # the drum moved mid-visit: the shift is not a deposit
+                    grams = 0
                 self.state["last_deposit_weight"] = grams
                 # Finalize the visit now that its deposit + settled weight are known: append + persist
                 # the record so the recent-visits table includes it and survives restarts.
                 if self._pending_visit is not None:
-                    record = dict(self._pending_visit)
-                    peak = record.get("peak")
-                    is_settled = len(self._occupied_samples) >= MIN_SETTLED_SAMPLES
-                    if is_settled:
-                        settled = round(statistics.median(self._occupied_samples) - self._pre_visit_baseline, 2)
-                        if settled < 0:
-                            settled = 0.0
-                    else:                              # too few genuine samples -> box max-hold peak
-                        settled = peak
-                    record["weight"] = settled
-                    record["deposit"] = grams
-                    self.state["last_visit_weight"] = settled
-                    # Cat identification: label this visit from its settled weight and update the
-                    # tracked weights. PURE ANALYSIS -- fully isolated so it can never break decode or
-                    # reach the box side (defensive try/except around all of it).
-                    if self.cats is not None:
-                        try:
-                            self.state.update(self.cats.on_visit(settled, record, settled=is_settled))
-                            self.cats.save()
-                        except Exception as exc:  # pragma: no cover - defensive
-                            log("cat_label_error", error=type(exc).__name__)
-                    self.recent_visits.append(record)
-                    self._persist_visits()
+                    self._finalize_visit(self._pending_visit, list(self._occupied_samples),
+                                         self._pre_visit_baseline, grams, orphan=self._visit_saw_cycle)
                     self._pending_visit = None
+                    self._closed_visit = None
+                else:
+                    # The box sometimes reports a visit only AFTER the occupancy closed (a cat that stepped
+                    # into a clean cycle: the report follows the resumed cycle). Keep this occupancy's data
+                    # briefly so that late report is paired with it, never with a later, unrelated one.
+                    self._closed_visit = {"at": time.monotonic(), "samples": list(self._occupied_samples),
+                                          "pre": self._pre_visit_baseline, "grams": grams,
+                                          "saw_cycle": self._visit_saw_cycle}
                 self._visit_open = False
                 self._occupied_samples = []
             # Baseline guard. At/under baseline+band == the normal empty level: accept and clear any
@@ -395,10 +408,98 @@ class GatewayState:
             # high lag reading is already rejected above, the median rides out a one-off low one). The box
             # has no litter-level sensor; HA derives "litter low" from this (see docs/DESIGN.md).
             if self._empty_baseline is not None:
-                self._litter_hist.append(self._empty_baseline)
+                raw = self._empty_baseline
+                if self._new_box_session:
+                    # First trusted empty reading of a new box session. The box re-zeroes at power-up with
+                    # the litter in it: near 0 now, but substantial before -> carry the old weight over.
+                    self._new_box_session = False
+                    prev = self._litter_known
+                    if prev is not None and prev >= LITTER_REZERO_MIN_PREV and raw <= LITTER_REZERO_MAX_NOW:
+                        self._litter_offset = round(prev - raw, 2)
+                        self._litter_hist.clear()
+                        log("litter_rezero", prev=prev, raw=raw, offset=self._litter_offset)
+                        self._persist_litter()
+                self._litter_hist.append(raw)
                 if len(self._litter_hist) >= LITTER_WEIGHT_MIN_SAMPLES:
-                    self.state["litter_weight"] = round(statistics.median(self._litter_hist), 2)
+                    lw = round(statistics.median(self._litter_hist) + self._litter_offset, 2)
+                    self.state["litter_weight"] = lw
+                    if lw != self._litter_known:
+                        self._litter_known = lw
+                        self._persist_litter()
         self._prev_occupied = occupied
+
+    def _finalize_visit(self, pending, samples, pre, grams, orphan=False):
+        """Append + persist one completed visit with its settled weight, deposit and cat label. Called
+        under self.lock. `orphan`: the visit overlapped a clean cycle, so its weight is not one cat."""
+        record = dict(pending)
+        peak = record.get("peak")
+        is_settled = pre is not None and len(samples) >= MIN_SETTLED_SAMPLES
+        if is_settled:
+            settled = round(statistics.median(samples) - pre, 2)
+            if settled < 0:
+                settled = 0.0
+        else:                                          # too few genuine samples -> box max-hold peak
+            settled = peak
+        record["weight"] = settled
+        record["deposit"] = grams
+        if orphan:
+            record["during_clean"] = True
+        self.state["last_visit_weight"] = settled
+        # Cat identification: label this visit from its settled weight and update the tracked weights.
+        # PURE ANALYSIS -- fully isolated so it can never break decode or reach the box side.
+        if self.cats is not None:
+            try:
+                self.state.update(self.cats.on_visit(settled, record, settled=is_settled, orphan=orphan))
+                self.cats.save()
+            except Exception as exc:  # pragma: no cover - defensive
+                log("cat_label_error", error=type(exc).__name__)
+        self.recent_visits.append(record)
+        self._persist_visits()
+
+    def on_box_session(self):
+        """A new box MQTT session started (box boot, Wi-Fi reconnect, or a gateway restart)."""
+        with self.lock:
+            self._new_box_session = True
+
+    def litter_reset(self):
+        """GATEWAY-INTERNAL (button): the box's zero is the EMPTY drum again. For a full litter change:
+        empty the drum, power-cycle the box, press this, refill. Drops the carried re-zero offset; the litter
+        weight re-appears after LITTER_WEIGHT_MIN_SAMPLES readings. Never touches the box."""
+        with self.lock:
+            self._litter_offset = 0.0
+            self._litter_known = None
+            self._litter_hist.clear()
+            self._new_box_session = False
+            self.state.pop("litter_weight", None)
+            self._persist_litter()
+            log("litter_reset")
+            self._touch()
+
+    def _load_litter(self):
+        if not self.litter_file:
+            return
+        try:
+            with open(self.litter_file) as handle:
+                data = json.load(handle)
+            off, known = data.get("offset", 0.0), data.get("litter_weight")
+            if isinstance(off, (int, float)) and not isinstance(off, bool) and 0 <= off <= 10:
+                self._litter_offset = float(off)
+            if isinstance(known, (int, float)) and not isinstance(known, bool) and 0 <= known <= 10:
+                self._litter_known = float(known)
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _persist_litter(self):
+        """Atomic, best-effort; never raises. Written only when the rounded litter weight changes."""
+        if not self.litter_file:
+            return
+        try:
+            tmp = self.litter_file + ".tmp"
+            with open(tmp, "w") as handle:
+                json.dump({"offset": self._litter_offset, "litter_weight": self._litter_known}, handle)
+            os.replace(tmp, self.litter_file)
+        except OSError as exc:
+            log("litter_persist_failed", error=type(exc).__name__)
 
     def _load_visits(self):
         """Reload the persisted recent-visits log on startup. Best-effort; never raises."""
@@ -438,11 +539,25 @@ class GatewayState:
                 # Stage the visit row (host clock; the box clock is unreliable). It is appended to the
                 # recent-visits log once _update_deposit computes this visit's deposit + settled weight,
                 # at which point `weight` becomes the settled value and `peak` keeps the box max-hold.
-                self._pending_visit = {
+                pending = {
                     "time": now.strftime("%b %-d %H:%M"),
                     "peak": peak,
                     "duration": "%dm %02ds" % (mm, ss),
                 }
+                if self._visit_open:
+                    self._pending_visit = pending     # normal: finalized at the next idle+empty heartbeat
+                else:
+                    # Late report: the occupancy already closed. Pair it with that occupancy if it closed
+                    # recently; otherwise there is nothing to measure it against. Either way finalize it
+                    # NOW so it can never attach to a later, unrelated visit.
+                    closed = self._closed_visit
+                    self._closed_visit = None
+                    if closed is not None and time.monotonic() - closed["at"] <= LATE_REPORT_GRACE_S:
+                        self._finalize_visit(pending, closed["samples"], closed["pre"], closed["grams"],
+                                             orphan=closed["saw_cycle"])
+                    else:
+                        self._finalize_visit(pending, [], None, 0, orphan=True)
+                    log("visit_late_report", paired=closed is not None)
                 self._touch()
 
     def on_unknown_frame(self, command, body):
@@ -579,6 +694,10 @@ class Session:
         self.conn.settimeout(keepalive * 1.5 + 5 if keepalive else NO_KEEPALIVE_TIMEOUT_S)
         self.send(b"\x20\x02\x00\x00")
         self.connected = True
+        try:
+            GW.on_box_session()     # pure analysis bookkeeping (litter re-zero check); never sends
+        except Exception as exc:  # pragma: no cover - defensive
+            log("session_hook_error", error=type(exc).__name__)
 
     def on_subscribe(self, body):
         global command_filter, heartbeat_topic
@@ -643,6 +762,9 @@ class Session:
             GW.on_visit(body)
         elif command in (CLEAN_END_COMMAND, TIME_REQ_COMMAND):
             pass  # known, nothing to surface beyond the full-hex log above
+        elif command in COMMAND_CODES:
+            # The box's reply to a command we sent (e.g. 0x015a body 0100 after clean): known, not new.
+            log("command_reply", sid=self.sid, command="0x%04x" % command, body_hex=body.hex())
         elif command == DRAWER_EVENT_COMMAND:
             # Known event (drawer reinsertion); a greppable line, deliberately NOT the unknown-frame channel.
             # It does not mean the drawer was emptied, so nothing is derived from it (by design).
@@ -773,8 +895,15 @@ def is_box(ip):
 # ====================================================================================================
 def handle_command(object_id, payload):
     """Runs on the HA reader thread. Isolated: any failure is logged and cannot reach the box loop."""
-    # GATEWAY-INTERNAL cat-ID commands are handled here and NEVER forwarded to the box: they do not
-    # look up COMMANDS, build a box frame, consult a movement/settings interlock, or call publish_to_box.
+    # GATEWAY-INTERNAL commands (cat ID, litter reset) are handled here and NEVER forwarded to the box:
+    # they do not look up COMMANDS, build a box frame, consult an interlock, or call publish_to_box.
+    if object_id == "litter_reset":
+        try:
+            if (payload or "").strip().upper() == "PRESS":
+                GW.litter_reset()
+        except Exception as exc:  # pragma: no cover - defensive
+            log("litter_reset_error", error=type(exc).__name__)
+        return
     if object_id in CAT_COMMANDS:
         try:
             if object_id == "correct_last":
@@ -905,7 +1034,7 @@ def sensor_discovery():
                 topic=DIAG_TOPIC, diagnostic=True),
         _sensor("unmapped_change_count", "Unmapped change count", "{{ value_json.unmapped_change_count }}",
                 topic=DIAG_TOPIC, diagnostic=True),
-        _sensor("last_unknown_command", "Last unknown frame", "{{ value_json.last_unknown_command }}",
+        _sensor("last_unknown_command", "Last unknown frame", "{{ value_json.last_unknown_command | default(none) }}",
                 topic=DIAG_TOPIC, diagnostic=True, icon="mdi:alert-rhombus-outline"),
     ]
     items += cat_discovery()
@@ -997,6 +1126,9 @@ def command_discovery():
         switch("burial", "Soft-stool burial"),
         optimistic_switch("child_lock", "Child lock"),
         optimistic_switch("kitty", "Kitty mode"),
+        # Gateway-internal (never reaches the box): after a full litter change with the box power-cycled
+        # on an EMPTY drum, drop the carried re-zero offset. Its topic is subscribed in both builds.
+        button("litter_reset", "Litter reset (scale zeroed empty)", "mdi:scale-off"),
     ]
 
 
@@ -1080,8 +1212,8 @@ def ha_bridge():
                 client.subscribe("%s/+/set" % BASE)   # the "+" also covers the cat-ID command topics
                 log("ha_subscribed_commands")
             elif CAT_COMMANDS:
-                # Sensor-only: still accept the gateway-internal cat-ID commands (pure analysis, never
-                # reach the box), so correction / weigh-in work without the box command half.
+                # Sensor-only: still accept the gateway-internal commands (pure analysis, never reach the
+                # box), so correction / weigh-in / litter reset work without the box command half.
                 for obj in sorted(CAT_COMMANDS):
                     client.subscribe("%s/%s/set" % (BASE, obj))
                 log("ha_subscribed_cat_commands")
@@ -1161,7 +1293,7 @@ def main():
     if cfg.skip_peer_check:
         log("peer_check_disabled", warning="CATLINK_SKIP_PEER_CHECK=1: ANY peer is accepted on the box port; "
                                            "for tests only")
-    GW = GatewayState(cfg.visits_file, cfg.cats, cfg.cats_file)
+    GW = GatewayState(cfg.visits_file, cfg.cats, cfg.cats_file, cfg.litter_file)
     if not cfg.no_ha:
         threading.Thread(target=ha_bridge, daemon=True).start()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

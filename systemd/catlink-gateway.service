@@ -16,7 +16,7 @@ EnvironmentFile=/etc/catlink-local/catlink-local.env
 LoadCredential=ha_mqtt_pass:/etc/catlink-local/ha_mqtt.pass
 ExecStart=/usr/bin/python3 -I -u /opt/catlink-local/gateway.py
 DynamicUser=yes
-# visits.jsonl + cats.json live in /var/lib/catlink-local (exported as $STATE_DIRECTORY).
+# visits.jsonl, cats.json and litter.json live in /var/lib/catlink-local (exported as $STATE_DIRECTORY).
 StateDirectory=catlink-local
 CapabilityBoundingSet=
 AmbientCapabilities=

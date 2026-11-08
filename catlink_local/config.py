@@ -182,6 +182,7 @@ def load(role, env=None):
     c.cats = parse_cats(env.get("CATLINK_CATS", ""))
     c.visits_file = _state_file(env, "CATLINK_VISITS_FILE", "visits.jsonl")
     c.cats_file = _state_file(env, "CATLINK_CATS_FILE", "cats.json")
+    c.litter_file = _state_file(env, "CATLINK_LITTER_FILE", "litter.json")
     c.no_ha = _flag(env, "CATLINK_NO_HA")
 
     # --- role-specific checks ---

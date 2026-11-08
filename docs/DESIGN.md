@@ -105,6 +105,11 @@ error, child-lock and kitty readback) are not exposed at all rather than guessed
   after topping up litter is adopted after 3 consecutive readings agree within 0.10 kg.
 - The **deposit** is the baseline shift across the visit; under 30 g it reads 0.
 - `recent_visits` keeps the last 15 visits, persisted in `visits.jsonl` under the state directory.
+- **A cat stepping into a running clean cycle.** The box pauses (`interrupted`), finishes the cycle and only
+  then reports the visit, tens of seconds after the occupancy ended. A late report is paired with the
+  occupancy that closed within the last 180 s (`LATE_REPORT_GRACE_S`), never with a later one. If that
+  occupancy overlapped a clean cycle, the drum was turned, so the weight is not one whole cat and the shift
+  is not a deposit: the row is marked `during_clean`, deposit 0, and with cats it is `unknown`.
 - On start the last-visit sensors (weight, duration, deposit and, with cats, the label) are restored from
   the last `visits.jsonl` row, so a restart does not leave Home Assistant showing a stale value.
 
@@ -120,6 +125,18 @@ which matches the drum's volume times the litter's density). So the gateway publ
 median of the last 5 trusted empty baselines (the guards above already reject a cat on the scale and
 mid-cycle readings; the median rides out a single low one). It appears after 3 readings.
 
+**The box re-zeroes its scale at power-up, with the litter in it.** After a power-cycle the empty scale read
+0.00 kg instead of about 3.4 kg, so without a correction the litter weight drops to ~0 and a "litter low"
+alarm fires falsely. The gateway therefore carries an offset: on a new box session, if the first trusted
+empty reading is at most 0.30 kg while the last litter weight was at least 1.0 kg, that is a re-zero and the
+old weight is kept. A plain reconnect reads the same raw weight and changes nothing, and a low reading within
+one session is never treated as a re-zero. The offset and the last litter weight persist in `litter.json`
+and are restored on start.
+
+A box powered on with an **empty** drum looks exactly like one powered on full, so for a full litter change:
+empty the drum, power-cycle the box, press **Litter reset (scale zeroed empty)** (command half; or publish
+`PRESS` to `BASE/litter_reset/set`), then refill.
+
 The threshold depends on your litter, so it lives in Home Assistant, not in the gateway. As a starting
 point: the Open X is sold as holding about 4 L to the MAX line (retailer listings; no official figure was
 found). Bentonite clumping litter is roughly 0.8–1.0 kg/L, so a full drum is about 3.2–4 kg;
@@ -133,7 +150,8 @@ touches an interlock. Scale resolution is 10 g with ±20–30 g noise, and cats'
 treat labels as estimates.
 
 - **0 cats (default)**: no tracker, no cat entities, no cat topics.
-- **1 cat**: every visit is that cat (conf 100); tracked weight is the median of the rolling window.
+- **1 cat**: every visit is that cat (conf 100); tracked weight is the median of the rolling window. A
+  weight more than 0.30 kg from it (once it has samples), or a visit during a clean cycle, is not a sample.
 - **2 cats** (`slug=kg` pairs, lighter first):
   - each visit is labelled by gaussian likelihood (σ = 70 g) against two reference weights, with a
     confidence %;
@@ -141,6 +159,10 @@ treat labels as estimates.
   - if the references are closer than 150 g the tracker is **degraded** and labels everything `unknown`;
   - a visit too short for a settled weight (the box's max-hold peak stands in) is less certain: it gets
     twice the band (±120 g) and never becomes a weight sample;
+  - a weight more than 0.30 kg below the lighter cat or above the heavier one is not one whole cat (paws
+    only, a cat on a turning drum, both cats at once) and is `unknown`, never a sample. This applies to a
+    cat only once its reference has weight samples, so rough seeds cannot lock every visit out;
+  - a visit that overlapped a clean cycle is `unknown` (see "Visit weight and deposit");
   - **no timing rule**: each visit is labelled on its own weight. An earlier rule ("two visits within
     15 min are different cats") kept mislabelling one cat coming back several times in a row, so it was
     removed. When unsure, the label is `unknown`; a degraded tracker recovers through `set_ref_<slug>`;

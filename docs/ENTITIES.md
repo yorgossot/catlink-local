@@ -31,9 +31,10 @@ or text.
 | `PREFIX/<component>/NODE/<object_id>/config` | yes | discovery |
 | `BASE/correct_last/set` | no | gateway-internal, payload a cat slug (only with `CATLINK_CATS`) |
 | `BASE/set_ref_<slug>/set` | no | gateway-internal, payload kg (only with `CATLINK_CATS`) |
+| `BASE/litter_reset/set` | no | gateway-internal, payload `PRESS`: drop the litter re-zero offset |
 
-The two gateway-internal topics are handled inside the gateway and never reach the box. They are
-subscribed only when `CATLINK_CATS` is set, in both modes.
+The gateway-internal topics are handled inside the gateway and never reach the box. They are subscribed
+in both modes; the two cat topics only when `CATLINK_CATS` is set.
 
 Mosquitto ACL for the gateway's user `catlink`:
 ```
@@ -97,6 +98,7 @@ is finalised. See [PROTOCOL.md](PROTOCOL.md) §5.
 | switch | burial | Soft-stool burial | `switch.catlink_open_x_soft_stool_burial` | ON / OFF |
 | switch | child_lock | Child lock | `switch.catlink_open_x_child_lock` | ON / OFF, optimistic (no readback) |
 | switch | kitty | Kitty mode | `switch.catlink_open_x_kitty_mode` | ON / OFF, optimistic (no readback) |
+| button | litter_reset | Litter reset (scale zeroed empty) | `button.catlink_open_x_litter_reset_scale_zeroed_empty` | payload `PRESS`; gateway-internal, never reaches the box. Press after a full litter change (see DESIGN.md) |
 
 With commands off these entities are not discovered, the gateway does not subscribe to `BASE/+/set`, and
 it has no path that can PUBLISH to the box. On every connect in that mode it also publishes an empty

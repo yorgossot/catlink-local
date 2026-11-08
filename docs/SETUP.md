@@ -309,9 +309,10 @@ default 10000 messages per 30 s); the gateway stays far below that in normal ope
 burst shows up as a `Suppressed N messages` line. If you set a positive `CATLINK_LOG_MAX_BYTES`, each
 process stops logging after that many bytes with a final `log_cap_reached`; a restart resets it.
 
-**State.** `visits.jsonl` and `cats.json` live in `/var/lib/catlink-local/` (with `DynamicUser=` this is a
-link to `/var/lib/private/catlink-local/`). Both can be deleted with the gateway stopped. Deleting
-`cats.json` re-seeds the cats from `CATLINK_CATS` (step 8).
+**State.** `visits.jsonl`, `cats.json` and `litter.json` live in `/var/lib/catlink-local/` (with
+`DynamicUser=` this is a link to `/var/lib/private/catlink-local/`). All can be deleted with the gateway
+stopped. Deleting `cats.json` re-seeds the cats from `CATLINK_CATS` (step 8); deleting `litter.json` drops the
+litter re-zero offset (the same as the "Litter reset" button).
 
 **Stale entities.** Command entities are removed automatically when `CATLINK_COMMANDS=0` (step 10). Cat
 sensors are not: once a slug is removed from `CATLINK_CATS` (or cats are turned off) the gateway no longer
