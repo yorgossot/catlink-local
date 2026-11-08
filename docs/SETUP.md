@@ -233,19 +233,26 @@ Every variable is listed there with its default. The file holds no secret.
 | `CATLINK_BOX_IP` | `<box-ip>` (recommended: then the peer must match IP **and** MAC; leave empty for MAC only) |
 | `CATLINK_AUTH_BIND_IP` | only if the responder uses a second address (step 4) |
 | `CATLINK_HA_HOST`, `CATLINK_HA_PORT` | your Mosquitto, default `127.0.0.1:1883`; a host name or an IP address both work, an IP avoids depending on DNS |
-| `CATLINK_CATS` | optional, e.g. `cat_a=3.20,cat_b=4.60`: one or two `slug=kg`, lighter first (strictly lighter kg). Slugs (`[a-z][a-z0-9_]*`, unique, not `unknown`/`last_visit`/`last_deposit`) become entity ids; kg between 0.2 and 12. Default off |
+| `CATLINK_CATS` | optional, e.g. `cat_a=3.20,cat_b=4.60`: 1 to 3 `slug=kg`, rough seeds in any order. Slugs (`[a-z][a-z0-9_]*`, unique, not `unknown`/`last_visit`/`last_deposit`/`two_cat`/`two_cats`) become entity ids; kg between 0.2 and 12. Default off |
 | `CATLINK_COMMANDS` | leave `0` for now (step 10) |
 
 The responder advertises `CATLINK_BOX_BIND_IP:CATLINK_BOX_BIND_PORT` as the MQTT broker unless you set
 `CATLINK_ADVERTISED_MQTT_HOST` / `_PORT`.
 
-The kg values in `CATLINK_CATS` are **starting seeds only**: they are used until
-`/var/lib/catlink-local/cats.json` exists (it is written after the first visit or cat command), and the
-saved references win from then on. Editing the kg later changes nothing while the slugs stay the same. To
-re-seed, publish a weigh-in to `catlink/litterbox/set_ref_<slug>/set` (payload kg; see
-[examples/homeassistant/cat_weigh_in.yaml](../examples/homeassistant/cat_weigh_in.yaml)), or stop the
-gateway, delete `cats.json`, and start it again. Renaming or removing a slug makes the gateway ignore the old
-file (`cats_state_mismatch` in the journal) and start fresh.
+The kg values in `CATLINK_CATS` are **rough seeds**, used only on a fresh install, and never published as a
+cat's weight. From the first start the tracker keeps its state in `/var/lib/catlink-local/cats_v2.json`, and
+that wins: editing the kg later changes nothing while the slugs stay the same. On a fresh install the tracker
+first learns which weights the box sees ("Cat ID status" reads *Learning the cats*); a **weigh-in session**
+settles who is who at once: weigh every cat on a kitchen scale and enter each value within a day
+(`catlink/litterbox/set_ref_<slug>/set`, payload kg; see
+[examples/homeassistant/cat_weigh_in.yaml](../examples/homeassistant/cat_weigh_in.yaml)). Renaming or removing
+a slug makes the gateway ignore the old state (`cats_state_mismatch` in the journal) and start fresh.
+
+**Upgrading from 0.1 with cats.** The old `cats.json` is read once and migrated (the cats keep their learned
+weights, counters and last visit) and is never written again, so going back to 0.1 finds it as it was. The
+cat entities keep their entity ids, now on the `catlink/litterbox/cats` topic, and new ones appear (see
+[ENTITIES.md](ENTITIES.md)). If you went back to 0.1 for a while and it wrote `cats.json`, the next start of
+this version migrates that newer file again (`cats_v2_stale` in the journal).
 
 **Check:** a bad or missing value makes the service exit with status 2 and name the variable in the
 journal (step 9).
@@ -309,10 +316,12 @@ default 10000 messages per 30 s); the gateway stays far below that in normal ope
 burst shows up as a `Suppressed N messages` line. If you set a positive `CATLINK_LOG_MAX_BYTES`, each
 process stops logging after that many bytes with a final `log_cap_reached`; a restart resets it.
 
-**State.** `visits.jsonl`, `cats.json` and `litter.json` live in `/var/lib/catlink-local/` (with
-`DynamicUser=` this is a link to `/var/lib/private/catlink-local/`). All can be deleted with the gateway
-stopped. Deleting `cats.json` re-seeds the cats from `CATLINK_CATS` (step 8); deleting `litter.json` drops the
-litter re-zero offset (the same as the "Litter reset" button).
+**State.** `visits.jsonl`, `cats_v2.json` (and an old `cats.json`, read once) and `litter.json` live in
+`/var/lib/catlink-local/` (with `DynamicUser=` this is a link to `/var/lib/private/catlink-local/`). All can
+be deleted with the gateway stopped. Deleting `cats_v2.json` and `cats.json` starts the cat tracker from the
+`CATLINK_CATS` seeds (step 8); deleting `litter.json` drops the litter re-zero offset (the same as the
+"Litter reset" button). A file that does not parse is renamed `<file>.corrupt-<timestamp>` and logged
+(`state_file_corrupt`), never silently overwritten.
 
 **Stale entities.** Command entities are removed automatically when `CATLINK_COMMANDS=0` (step 10). Cat
 sensors are not: once a slug is removed from `CATLINK_CATS` (or cats are turned off) the gateway no longer
@@ -321,10 +330,13 @@ discovery configs are still on the broker. Remove them in one of two ways:
 - In Home Assistant: **Settings → Devices & services → Entities**, search `catlink_open_x_<old slug>`, select
   the entities and **Delete**. If HA refuses because the entity is still provided by MQTT, clear the
   retained config first (next item).
-- Clear the retained discovery configs, one per old cat object id (`<slug>_weight`, `<slug>_trend_7d`, and
-  with cats fully off also `cat_gap`, `last_visit_cat`, `labelled_pct`, `correction_count`):
+- Clear the retained discovery configs, one per old cat object id (the `<slug>_…` ids in
+  [ENTITIES.md](ENTITIES.md), and with cats fully off also the global cat ids such as `cat_status`,
+  `cat_gap`, `last_visit_cat`, `labelled_pct`, `correction_count`):
   ```sh
-  for id in <old-slug>_weight <old-slug>_trend_7d; do
+  for id in <old-slug>_weight <old-slug>_weight_lo <old-slug>_weight_hi <old-slug>_stale_reason \
+            <old-slug>_trend_7d <old-slug>_visits <old-slug>_visits_24h <old-slug>_last_seen \
+            <old-slug>_last_weigh_in; do
     mosquitto_pub -h 127.0.0.1 -u <mqtt-admin-user> -P '<mqtt-admin-password>' \
       -r -n -t "homeassistant/sensor/catlink_litterbox/$id/config"
   done
@@ -382,3 +394,7 @@ Find the event with `journalctl -u catlink-gateway -u catlink-authresp -o cat | 
 | `unknown_frame` | a frame type not decoded yet | harmless; shown on the "Last unknown frame" sensor; see CONTRIBUTING.md |
 | `command_refused` | an interlock failed (`reasons` lists which) | expected while a cat is in or near the box, the heartbeat is stale, or the box is not idle |
 | `log_cap_reached` | a positive `CATLINK_LOG_MAX_BYTES` was reached; nothing more is logged until restart | set it to `0` (default) and let journald rotate |
+| "Cat ID status" reads *Weigh every cat* (`needs_weigh_in`) | the tracker cannot tell the cats apart from the box alone (their weights crossed, one changed suddenly, or a recent weigh-in disagrees) | weigh every cat on a kitchen scale and enter each value within a day; one value alone waits (`pending`) |
+| a cat's weight is unknown, "weight status" *Not seen for 3 days* | no labelled visit or accepted weigh-in of that cat for 72 h | nothing, if the cat really was away; otherwise a weigh-in |
+| `state_file_corrupt` | a state file did not parse; it was moved aside as `<file>.corrupt-<timestamp>` | nothing to do; the gateway continues without it (`litter_offset_unknown`: press Litter reset after the next full litter change) |
+| `cats_v2_stale` | `cats.json` changed since this version migrated it (an older version ran meanwhile) | nothing: the newer `cats.json` was migrated again |

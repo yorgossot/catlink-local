@@ -4,9 +4,9 @@
 # Assistant from the device name, so check yours in Settings -> Devices & services -> Entities.
 #
 # Requires CATLINK_CATS with two cats, e.g. CATLINK_CATS=cat_a=3.20,cat_b=4.60. Replace cat_a / cat_b
-# (entity ids and the *_trend_word attributes) with your slugs, and the tile names with your cats' names.
-# Without cats, delete the two tiles, the history graph and the Cat column; the rest works in sensor-only
-# mode.
+# (entity ids, the *_trend_word attributes and the ['cat_a', 'cat_b'] lists) with your slugs, and the tile
+# names with your cats' names. Without cats, delete the two tiles, the "who is who" card, the history graph
+# and the Cat column; the rest works in sensor-only mode.
 #
 # Use: create a dashboard, open its raw configuration editor and paste this file, or save it as a
 # YAML-mode dashboard file.
@@ -38,6 +38,56 @@ views:
       state_content:
       - state
       - cat_b_trend_word
+
+  # ---- who is who: what the tracker is sure of, and what to do when it is not ----
+  # Reads the attributes of a weight sensor (the retained BASE/cats payload). "OK" only when the status is
+  # ok and no cat is "not identified" / "changed suddenly"; otherwise the weigh-in prompt, the weights the
+  # box sees without names, and each cat's last weigh-in result.
+  - type: markdown
+    content: |
+      {%- set e = 'sensor.catlink_open_x_cat_a_weight' -%}
+      {%- set cats = ['cat_a', 'cat_b'] -%}
+      {%- set st = state_attr(e, 'cat_status') -%}
+      {%- set L = namespace(lines=[], unid=[], sudden=[], ranges=[]) -%}
+      {%- for c in cats -%}
+      {%- set r = state_attr(e, c ~ '_stale_reason') -%}
+      {%- if r == 'not_identified' -%}{%- set L.unid = L.unid + [c | replace('_', ' ') | capitalize] -%}
+      {%- elif r == 'sudden_change' -%}{%- set L.sudden = L.sudden + [c | replace('_', ' ') | capitalize] -%}{%- endif -%}
+      {%- set lo = state_attr(e, c ~ '_weight_lo_kg') -%}
+      {%- set hi = state_attr(e, c ~ '_weight_hi_kg') -%}
+      {%- if lo is number and hi is number -%}
+      {%- set L.ranges = L.ranges + [(c | replace('_', ' ') | capitalize) ~ ' ' ~ ('%.2f' | format(lo)) ~ '–' ~ ('%.2f' | format(hi)) ~ ' kg'] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if st == 'needs_weigh_in' or (st == 'ok' and (L.unid or L.sudden)) -%}
+      {%- set L.lines = L.lines + ['⚖ **Weigh every cat** on a kitchen scale and enter each weight within a day: the box cannot tell who is who right now.'] -%}
+      {%- elif st == 'cant_tell_apart' -%}
+      {%- set L.lines = L.lines + ['The cats weigh too close to tell apart right now; weighing every cat helps.'] -%}
+      {%- elif st == 'learning' -%}
+      {%- set L.lines = L.lines + ['Learning the cats\' weights…'] -%}
+      {%- elif st == 'unavailable' -%}
+      {%- set L.lines = L.lines + ['Who is who · unavailable (gateway error, see its log)'] -%}
+      {%- elif st == 'ok' -%}
+      {%- set L.lines = L.lines + ['Who is who · OK'] -%}
+      {%- endif -%}
+      {%- if L.unid -%}{%- set L.lines = L.lines + [L.unid | join(' and ') ~ ' · not identified (weight not shown)'] -%}{%- endif -%}
+      {%- if L.sudden -%}{%- set L.lines = L.lines + [L.sudden | join(' and ') ~ ' · weight changed suddenly'] -%}{%- endif -%}
+      {%- if L.ranges -%}{%- set L.lines = L.lines + [L.ranges | join(' · ')] -%}{%- endif -%}
+      {%- if state_attr(e, 'scale_shift') -%}
+      {%- set L.lines = L.lines + ['Scale shift detected (every cat moved together)'] -%}
+      {%- endif -%}
+      {%- set lo = state_attr(e, 'cluster_low_kg') -%}
+      {%- set hi = state_attr(e, 'cluster_high_kg') -%}
+      {%- if (st not in [none, 'ok'] or L.unid or L.sudden) and lo is number and hi is number -%}
+      {%- set L.lines = L.lines + ['The box sees cats at ' ~ ('%.2f' | format(lo)) ~ ' kg and ' ~ ('%.2f' | format(hi)) ~ ' kg (names unknown).'] -%}
+      {%- endif -%}
+      {%- for c in cats -%}
+      {%- set w = state_attr(e, c ~ '_last_weigh_in') -%}
+      {%- if w and (st != 'ok' or not w.startswith('accepted')) -%}
+      {%- set L.lines = L.lines + [(c | replace('_', ' ') | capitalize) ~ ' weigh-in · ' ~ w] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ L.lines | join('<br>') if L.lines else 'Who is who · waiting for the gateway' }}
 
   # ---- at a glance: litter box, waste bin, drawer --------------------------
   # The waste bin line is always shown; the box reports only full / not full, no fill level.
@@ -76,7 +126,7 @@ views:
       #### Recent visits
       {% set visits = state_attr('sensor.catlink_open_x_visit_counter', 'recent_visits') or [] %}
       {% set ns = namespace(rows=[]) %}
-      {% for v in visits[:10] %}{% set who = '—' if (v.cat in [none, 'unknown']) else (v.cat | replace('_', ' ') | capitalize) %}{% set ns.rows = ns.rows + ['| ' ~ v.time ~ ' | ' ~ who ~ ' | ' ~ v.weight ~ ' kg | ' ~ v.duration ~ ' | ' ~ v.deposit ~ ' g |'] %}{% endfor %}
+      {% for v in visits[:10] %}{% set who = (v.cats | map('replace', '_', ' ') | map('capitalize') | join(' + ')) if v.cat == 'two_cats' and v.cats else ('—' if (v.cat in [none, 'unknown']) else (v.cat | replace('_', ' ') | capitalize)) %}{% set kg = (v.weights | map('string') | join(' / ') ~ ' kg') if v.weights else ((v.weight ~ ' kg') if v.weight is number else '—') %}{% set dep = (v.deposit ~ ' g') if v.deposit is number else '—' %}{% set ns.rows = ns.rows + ['| ' ~ v.time ~ ' | ' ~ who ~ ' | ' ~ kg ~ ' | ' ~ v.duration ~ ' | ' ~ dep ~ ' |'] %}{% endfor %}
       {% if visits %}
       | Time | Cat | Weight | Duration | Deposit |
       |---|---|---|---|---|

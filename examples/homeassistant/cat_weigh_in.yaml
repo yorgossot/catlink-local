@@ -1,13 +1,18 @@
 # Kitchen-scale weigh-ins for cat identification, as a Home Assistant package.
 #
-# Requires CATLINK_CATS, e.g. CATLINK_CATS=cat_a=3.20,cat_b=4.60 (lighter first). Replace cat_a / cat_b
-# with your slugs; for one cat, delete the cat_b parts. Topics assume the default CATLINK_BASE
+# Requires CATLINK_CATS, e.g. CATLINK_CATS=cat_a=3.20,cat_b=4.60. Replace cat_a / cat_b with your slugs; for
+# one cat, delete the cat_b parts; for a third cat, copy them. Topics assume the default CATLINK_BASE
 # (catlink/litterbox). Works in both modes: the set_ref topics are handled inside the gateway and never
 # reach the box.
 #
-# Entering a weight re-seeds that cat's reference weight. With two cats the gateway keeps the references
-# at least 150 g apart. This is the way to re-seed after the first visit: the kg values in CATLINK_CATS
-# are used only until the gateway's cats.json exists.
+# A weigh-in is a measurement for a cat the tracker already knows, and the way to tell the cats apart when
+# it cannot: "Cat ID status" then reads "Weigh every cat". Weigh EVERY cat and enter each value within a day
+# (a weigh-in session); a single value waits ("pending"). The result of each entry is on the
+# "<Cat> last weigh-in" sensor (accepted / pending / rejected + why).
+#
+# These helpers send a value only when it CHANGES. To repeat or confirm a weight (e.g. one that was rejected
+# as far from the cat's track), enter it changed by 0.01 kg (3.31 for 3.30): the tracker takes values within
+# 50 g as the same confirmation.
 #
 # Install as a package: save as <config>/packages/catlink_weigh_in.yaml and make sure configuration.yaml has
 #   homeassistant:
@@ -36,7 +41,7 @@ input_number:
 automation:
 - id: catlink_weigh_in_cat_a
   alias: 'CATLINK: publish cat_a weigh-in'
-  description: Send a kitchen-scale weight to the gateway as cat_a's reference.
+  description: Send a kitchen-scale weight of cat_a to the gateway.
   mode: restart
   triggers:
   - trigger: state
@@ -54,7 +59,7 @@ automation:
 
 - id: catlink_weigh_in_cat_b
   alias: 'CATLINK: publish cat_b weigh-in'
-  description: Send a kitchen-scale weight to the gateway as cat_b's reference.
+  description: Send a kitchen-scale weight of cat_b to the gateway.
   mode: restart
   triggers:
   - trigger: state

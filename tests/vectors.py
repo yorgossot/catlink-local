@@ -84,7 +84,7 @@ def heartbeat(mac=TEST_MAC, **fields):
 
 
 def visit_frame(mm, ss, kg, cg, mac=TEST_MAC):
-    """Visit report: body 01 03 mm ss kg cg (duration m:s, max-hold weight kg + hundredths)."""
+    """Visit report: body 01 03 mm ss kg cg (duration m:s, box weight kg + hundredths, not reliable)."""
     return box_frame(VISIT, bytes([0x01, 0x03, mm, ss, kg, cg]), mac=mac)
 
 

@@ -11,16 +11,17 @@ Fakes:
 
 Proves, in sensor-only (CATLINK_COMMANDS=0) and command (=1) modes, with and without CATLINK_CATS:
   1. correct HA discovery (read-only set in sensor mode; actuators added only in command mode);
-  2. correct state decoding of a heartbeat and a visit report, INCLUDING the settled-median visit weight
-     (not the box max-hold peak) and the sustained-litter-top-up baseline adoption;
+  2. correct state decoding of a heartbeat and a visit report, INCLUDING the visit weight from the live
+     cat-on-scale plateau (not the box's own report) and the sustained-litter-top-up baseline adoption;
   3. an UNKNOWN frame and a CHANGED unmapped byte surface on the diagnostic channel (no error);
   4. clean fires the correct box frame ONLY when the LATEST-heartbeat movement interlock passes and
      resume fires ONLY on its own paused+not-occupied gate; no frame is ever sent without an HA command;
   5. the box session survives malformed HA commands and a corrupt box frame;
   6. the Mosquitto password is never written to the gateway's log;
-  7. with cats: the cat sensors are discovered (both modes) and the GATEWAY-INTERNAL cat commands
-     (correct_last / set_ref_<slug>) apply locally and send NOTHING to the box; without cats: no cat
-     topics are subscribed and no cat keys appear in state.
+  7. with cats: the cat sensors are discovered (both modes) on the retained BASE/cats topic and the
+     GATEWAY-INTERNAL cat commands (correct_last / set_ref_<slug>) apply locally and send NOTHING to the box;
+     without cats: no cat topics are subscribed and no cat payload is published.
+The visit pipeline itself (pairing, segments, state files) is tested with a fake clock in test_pipeline.py.
 """
 import json
 import os
@@ -53,9 +54,11 @@ BASE = "catlinktest/box"
 NODE = "catlink_litterbox"
 CATS_ENV = "cat_a=3.20,cat_b=4.60"
 CAT_SENSORS = {"cat_a_weight", "cat_b_weight", "cat_a_trend_7d", "cat_b_trend_7d", "cat_gap",
-               "last_visit_cat", "labelled_pct", "correction_count"}
-CAT_STATE_KEYS = {"cat_a_weight", "cat_b_weight", "cat_a_trend_7d", "cat_b_trend_7d", "cat_a_trend_word",
-                  "cat_b_trend_word", "cat_gap", "labelled_pct", "correction_count", "cat_degraded"}
+               "last_visit_cat", "labelled_pct", "correction_count", "cat_status", "cat_a_stale_reason",
+               "cat_a_last_weigh_in", "cat_b_weight_lo", "cat_b_weight_hi", "cluster_low", "scale_shift"}
+CAT_KEYS = {"cat_a_weight", "cat_b_weight", "cat_a_growth_g_week", "cat_a_trend_word", "cat_b_trend_word",
+            "cat_gap", "labelled_pct_7d", "correction_count", "cat_status", "cat_a_stale_reason",
+            "cat_b_last_weigh_in", "cluster_low_kg", "scale_shift", "unknown_visits_total"}
 ACTUATOR_COMPONENTS = {"button", "switch", "select", "number"}
 
 
@@ -321,6 +324,9 @@ class GatewayScenarioTests(unittest.TestCase):
         def diag_now():
             return sink.latest_json("diag")
 
+        def cats_now():
+            return sink.latest_json("cats")
+
         try:
             if not wait_for(lambda: '"event":"broker_start"' in logtext(), timeout=10):
                 self.fail("gateway did not start: %s" % logtext())
@@ -391,17 +397,33 @@ class GatewayScenarioTests(unittest.TestCase):
             check("visit_count carries recent_visits attributes",
                   cfgs.get("sensor/visit_count", {}).get("json_attributes_topic") == BASE + "/visits")
             measured = {"sensor/live_scale", "sensor/last_visit_weight", "sensor/last_deposit_weight",
-                        "sensor/wifi_signal", "sensor/litter_weight"} | ({"sensor/cat_a_weight", "sensor/cat_b_weight"} if cats else set())
+                        "sensor/wifi_signal", "sensor/litter_weight"}
+            if cats:
+                measured |= {"sensor/%s%s" % (c, s) for c in ("cat_a", "cat_b")
+                             for s in ("_weight", "_weight_lo", "_weight_hi", "_visits_24h")}
+                measured |= {"sensor/visits_24h_total"}
             with_class = {k for k, c in cfgs.items() if c.get("state_class") == "measurement"}
             check("state_class measurement exactly on the numeric measurements", with_class == measured,
                   sorted(with_class ^ measured))
+            counters = {k for k, c in cfgs.items() if c.get("state_class") == "total_increasing"}
+            want_counters = ({"sensor/cat_a_visits", "sensor/cat_b_visits", "sensor/unknown_visits",
+                              "sensor/two_cat_visits"} if cats else set())
+            check("state_class total_increasing exactly on the visit counters", counters == want_counters,
+                  sorted(counters ^ want_counters))
             sensors = {t.split("/")[3] for t, _, _ in configs if t.split("/")[1] == "sensor"}
             if cats:
                 check("cat sensors present in discovery", CAT_SENSORS <= sensors, sorted(CAT_SENSORS - sensors))
                 check("cat sensor names", cfgs.get("sensor/cat_a_weight", {}).get("name") == "Cat a weight"
-                      and cfgs.get("sensor/cat_b_trend_7d", {}).get("name") == "Cat b trend 7d")
-                check("cat state seeded before the first visit",
-                      wait_for(lambda: CAT_STATE_KEYS <= set(st_now())), sorted(st_now()))
+                      and cfgs.get("sensor/cat_b_trend_7d", {}).get("name") == "Cat b growth")
+                check("cat sensors read the retained cats topic",
+                      all(cfgs["sensor/" + o].get("state_topic") == BASE + "/cats" for o in CAT_SENSORS
+                          if "sensor/" + o in cfgs))
+                check("cat payload published (retained) before the first visit",
+                      wait_for(lambda: CAT_KEYS <= set(cats_now())), sorted(cats_now()))
+                check("cat payload retained", any(t == BASE + "/cats" and r for t, _, r in sink.msgs))
+                check("seeds are never published as weights",
+                      cats_now().get("cat_a_weight") is None and cats_now().get("cat_status") == "learning",
+                      {k: cats_now().get(k) for k in ("cat_a_weight", "cat_status")})
             else:
                 check("no cat sensors without CATLINK_CATS", not (CAT_SENSORS & sensors), sorted(CAT_SENSORS & sensors))
 
@@ -427,14 +449,18 @@ class GatewayScenarioTests(unittest.TestCase):
                   and st.get("live_scale") == 1.48 and st.get("occupied") is False and st.get("cleaning") is False
                   and st.get("state") == "idle" and st.get("box_clock") == "09:15",
                   {k: st.get(k) for k in ("mode", "litter_type", "live_scale", "occupied", "cleaning", "state")})
-            check("visit decoded (provisional weight = peak)",
-                  st.get("last_visit_weight") == 3.21 and st.get("last_visit_duration") == "1:42"
-                  and st.get("last_visit_seconds") == 102 and "last_visit_at" in st,
-                  {k: st.get(k) for k in ("last_visit_weight", "last_visit_duration", "last_visit_seconds")})
+            # a report with no occupancy behind it: its own row, the box report kept as last_visit_peak, and no
+            # weight (the report is not a weight)
+            check("visit decoded (report only: peak kept, no weight)",
+                  st.get("last_visit_weight") is None and st.get("last_visit_peak") == 3.21
+                  and st.get("last_visit_duration") == "1:42" and st.get("last_visit_seconds") == 102
+                  and "last_visit_at" in st,
+                  {k: st.get(k) for k in ("last_visit_weight", "last_visit_peak", "last_visit_duration")})
             check("availability online", wait_for(lambda: sink.latest(BASE + "/availability") == "online"))
+            check("no cat keys in the per-heartbeat state", not (CAT_KEYS | {"last_cat", "last_conf",
+                                                                             "last_visit_cat"}) & set(st), sorted(st))
             if not cats:
-                check("no cat keys in state without CATLINK_CATS",
-                      not (CAT_STATE_KEYS | {"last_cat", "last_conf", "last_visit_cat"}) & set(st), sorted(st))
+                check("no cat payload without CATLINK_CATS", sink.latest(BASE + "/cats") is None)
 
             # --- diagnostics: unknown frame ---
             box.publish(v.FN_TOPIC, v.box_frame(0x995A, b"\x01\x02\x03\x04"))
@@ -571,26 +597,27 @@ class GatewayScenarioTests(unittest.TestCase):
             check("box session survives a corrupt frame", ok and diag_now().get("last_unknown_command") == "unparsable",
                   diag_now().get("last_unknown_command"))
 
-            # --- settled-median visit weight + sustained baseline adoption (decode-only; both modes) ---
-            # (A) Establish a trusted empty baseline at 1.50 kg (idle + unoccupied).
-            for _ in range(2):
+            # --- plateau visit weight + sustained baseline adoption (decode-only; both modes) ---
+            # (A) Establish a trusted empty baseline at 1.50 kg (idle + unoccupied): 3 readings.
+            for _ in range(3):
                 box.publish(v.HB_TOPIC, v.heartbeat(state=0, occ=0, touch=0, kg=1, cg=50, visit=11))
                 time.sleep(0.25)
-            # Cat enters: three genuine cat-on-scale readings well above baseline+band: 4.50/4.40/4.60 kg.
-            for cg in (50, 40, 60):
+            # Cat enters: three cat-on-scale readings well above baseline+band, one plateau: 4.50/4.49/4.51 kg.
+            for cg in (50, 49, 51):
                 box.publish(v.HB_TOPIC, v.heartbeat(state=0, occ=0x26, touch=0, kg=4, cg=cg, visit=11))
                 time.sleep(0.25)
-            # The box's own visit report carries a max-hold PEAK that overstates (5.00 kg).
-            box.publish(v.FN_TOPIC, v.visit_frame(1, 30, 5, 0))
-            ok = wait_for(lambda: st_now().get("last_visit_weight") == 5.0)
-            check("provisional visit weight is the box max-hold peak", ok, st_now().get("last_visit_weight"))
+            # The box's own visit report (5.00 kg, not a weight) at the cat's exit. Its duration (1 s) fits this
+            # sub-second test occupancy, so it pairs with it.
+            box.publish(v.FN_TOPIC, v.visit_frame(0, 1, 5, 0))
+            time.sleep(0.25)
             # Cat exits: the first idle+unoccupied reading (1.55 kg) finalizes the visit.
             box.publish(v.HB_TOPIC, v.heartbeat(state=0, occ=0, touch=0, kg=1, cg=55, visit=12))
-            # settled weight = MEDIAN(4.50,4.40,4.60) - baseline(1.50) = 3.00, NOT the 5.00 peak.
+            # weight = median of the plateau (4.50,4.49,4.51) - baseline (1.50) = 3.00, NOT the 5.00 report.
             ok = wait_for(lambda: st_now().get("last_visit_weight") == 3.0)
             st = st_now()
-            check("settled visit weight = median(cat-on-scale) - baseline, not the peak",
-                  ok and st.get("last_visit_weight") == 3.0, st.get("last_visit_weight"))
+            check("visit weight = plateau median - baseline, the box report kept apart",
+                  ok and st.get("last_visit_weight") == 3.0 and st.get("last_visit_peak") == 5.0,
+                  {k: st.get(k) for k in ("last_visit_weight", "last_visit_peak")})
             # deposit = exit baseline (1.55) - pre-visit baseline (1.50) = 0.05 kg = 50 g (> 30 g noise floor).
             check("deposit weight from the baseline shift", st.get("last_deposit_weight") == 50,
                   st.get("last_deposit_weight"))
@@ -603,11 +630,12 @@ class GatewayScenarioTests(unittest.TestCase):
             for _ in range(2):
                 box.publish(v.HB_TOPIC, v.heartbeat(state=0, occ=0x26, touch=0, kg=5, cg=0, visit=12))
                 time.sleep(0.25)
-            box.publish(v.FN_TOPIC, v.visit_frame(1, 0, 6, 0))
+            box.publish(v.FN_TOPIC, v.visit_frame(0, 1, 6, 0))
+            time.sleep(0.25)
             box.publish(v.HB_TOPIC, v.heartbeat(state=0, occ=0, touch=0, kg=2, cg=10, visit=13))
             ok = wait_for(lambda: st_now().get("visit_count") == 13 and st_now().get("last_deposit_weight") == 100)
             st = st_now()
-            # Adopted: deposit = 2.10 - 2.00 = 100 g (NOT 2.10 - 1.55 = 550 g); settled = median(5.0,5.0) - 2.0 = 3.0.
+            # Adopted: deposit = 2.10 - 2.00 = 100 g (NOT 2.10 - 1.55 = 550 g); weight = median(5.0,5.0) - 2.0 = 3.0.
             check("sustained litter top-up adopted as new baseline (deposit from ~2.00 kg)",
                   ok and st.get("last_deposit_weight") == 100 and st.get("last_visit_weight") == 3.0,
                   {"deposit": st.get("last_deposit_weight"), "weight": st.get("last_visit_weight")})
@@ -616,32 +644,42 @@ class GatewayScenarioTests(unittest.TestCase):
             ok = wait_for(lambda: len(sink.latest_json("visits").get("recent_visits", [])) >= 2)
             rows = sink.latest_json("visits").get("recent_visits", [])
             newest = rows[0] if rows else {}
-            keys = {"time", "peak", "duration", "weight", "deposit"} | ({"cat", "conf"} if cats else set())
+            keys = {"time", "ts", "peak", "duration", "weight", "deposit", "source", "kind", "n", "pre",
+                    "baseline_unc"} | ({"cat", "conf"} if cats else set())
             check("recent_visits newest first with the documented row", ok and set(newest) == keys
                   and newest.get("peak") == 6.0 and newest.get("weight") == 3.0 and newest.get("deposit") == 100
-                  and newest.get("duration") == "1m 00s" and len(rows) <= 15, newest)
+                  and newest.get("duration") == "0m 01s" and newest.get("source") == "box"
+                  and newest.get("kind") == "plateau" and len(rows) <= 15, newest)
             check("visits persisted to the state file", os.path.exists(os.path.join(self.dir, "visits.jsonl")))
             if cats:
                 check("visit carries a cat label", newest.get("cat") in ("cat_a", "cat_b", "unknown")
-                      and isinstance(newest.get("conf"), int), newest)
+                      and (newest.get("conf") is None if newest.get("cat") == "unknown"
+                           else isinstance(newest.get("conf"), int)), newest)
 
             # --- GATEWAY-INTERNAL cat commands: apply locally, send NOTHING to the box ---
             box_n = len(box.received)
             if cats:
-                before_cc = st_now().get("correction_count", 0)
+                before_cc = cats_now().get("correction_count") or 0
                 sink.inject(BASE + "/correct_last/set", "cat_b")
-                okc = wait_for(lambda: st_now().get("correction_count", 0) > before_cc)
-                check("correct_last relabels locally (correction_count++)", okc, st_now().get("correction_count"))
+                okc = wait_for(lambda: (cats_now().get("correction_count") or 0) > before_cc)
+                check("correct_last relabels locally (correction_count++)", okc, cats_now().get("correction_count"))
+                check("the corrected row is republished", wait_for(
+                    lambda: (sink.latest_json("visits").get("recent_visits") or [{}])[0].get("cat") == "cat_b"))
                 sink.inject(BASE + "/set_ref_cat_a/set", "3.30")
                 ok = wait_for(lambda: '"event":"cat_command","object":"set_ref_cat_a","applied":true' in logtext())
                 check("set_ref_cat_a applied", ok)
-                check("cats.json written", wait_for(lambda: os.path.exists(os.path.join(self.dir, "cats.json"))))
+                check("weigh-in result published",
+                      wait_for(lambda: (cats_now().get("cat_a_last_weigh_in") or "").split(" ")[0]
+                               in ("accepted", "pending", "rejected")), cats_now().get("cat_a_last_weigh_in"))
+                check("cats_v2.json written, cats.json (0.1 format) never",
+                      wait_for(lambda: os.path.exists(os.path.join(self.dir, "cats_v2.json")))
+                      and not os.path.exists(os.path.join(self.dir, "cats.json")))
             else:
                 sink.inject(BASE + "/correct_last/set", "cat_b")
                 sink.inject(BASE + "/set_ref_cat_a/set", "3.30")
                 time.sleep(1.0)
                 check("cat commands ignored without CATLINK_CATS",
-                      '"event":"cat_command"' not in logtext() and "correction_count" not in st_now())
+                      '"event":"cat_command"' not in logtext() and sink.latest(BASE + "/cats") is None)
             time.sleep(0.5)
             check("cat commands sent NOTHING to the box", len(box.received) == box_n,
                   "received=%d" % (len(box.received) - box_n))
@@ -708,18 +746,23 @@ class LitterWeightAndRestoreTests(unittest.TestCase):
         self.assertIsNone(self.feed(gs, 3.20))
         self.assertIsNone(self.feed(gs, 3.22))                 # not published before 3 readings
         self.assertEqual(self.feed(gs, 3.21), 3.21)            # median of the first 3
-        for scale in (0.66, 0.70):                             # mid-cycle readings: not idle -> ignored
-            self.feed(gs, scale, state="cleaning")
         self.feed(gs, 5.40, occupied=True)                     # a cat on the scale -> ignored
+        self.feed(gs, 3.21)                                    # (the cat left)
         self.assertEqual(gs.state["litter_weight"], 3.21)
-        self.feed(gs, 1.10)                                    # ONE low idle reading: the median rides it out
+        self.feed(gs, 1.10)                                    # ONE low idle reading outside a cycle: rejected
         self.assertEqual(gs.state["litter_weight"], 3.21)
-        for _ in range(3):                                     # litter really removed: followed
-            self.feed(gs, 0.70)
+        for _ in range(5):                                     # litter really removed: 2 agreeing readings
+            self.feed(gs, 0.70)                                # adopt it, the median follows
         self.assertEqual(gs.state["litter_weight"], 0.70)
-        for _ in range(6):                                     # top-up: adopted after the re-litter confirmation
+        for _ in range(8):                                     # top-up: adopted after the re-litter confirmation
             self.feed(gs, 3.25)
         self.assertEqual(gs.state["litter_weight"], 3.25)
+        for scale in (2.66, 2.70):                             # mid-cycle readings: not idle -> ignored
+            self.feed(gs, scale, state="cleaning")
+        self.assertEqual(gs.state["litter_weight"], 3.25)
+        for _ in range(5):                                     # the first empty reading after a clean cycle
+            self.feed(gs, 3.05)                                # is adopted at once (the clean removed litter)
+        self.assertEqual(gs.state["litter_weight"], 3.05)
 
     def write_visit(self, **row):
         base = {"time": "Jan 7 09:15", "peak": 3.4, "duration": "3m 28s", "weight": 3.05, "deposit": 40}
@@ -738,20 +781,21 @@ class LitterWeightAndRestoreTests(unittest.TestCase):
         self.write_visit(cat="cat_a", conf=82)
         gs = gwmod.GatewayState(self.visits, cats=[("cat_a", 3.2), ("cat_b", 4.6)],
                                 cats_file=os.path.join(self.dir, "cats.json"))
-        self.assertEqual(gs.state.get("last_visit_cat"), "Cat a 82%")
+        self.assertEqual(json.loads(gs.snapshot()[4]).get("last_visit_cat"), "Cat a 82%")
         self.assertEqual(gs.state.get("last_visit_weight"), 3.05)
 
     def test_restart_ignores_a_malformed_last_row(self):
         self.write_visit(weight="x", deposit=True, duration="soon", cat="someone_else", conf=50)
         gs = gwmod.GatewayState(self.visits, cats=[("cat_a", 3.2), ("cat_b", 4.6)],
                                 cats_file=os.path.join(self.dir, "cats.json"))
-        for key in ("last_visit_weight", "last_deposit_weight", "last_visit_duration", "last_visit_cat"):
+        for key in ("last_visit_weight", "last_deposit_weight", "last_visit_duration"):
             self.assertNotIn(key, gs.state)
+        self.assertIsNone(json.loads(gs.snapshot()[4]).get("last_visit_cat"))
 
 
-class RezeroAndLateReportTests(unittest.TestCase):
-    """The box re-zeroes its scale at power-up with the litter in it; a visit report can arrive after
-    its occupancy closed (a cat stepped into a running clean cycle)."""
+class RezeroTests(unittest.TestCase):
+    """The box re-zeroes its scale at power-up with the litter in it (late visit reports and the rest of the
+    visit pipeline: test_pipeline.py)."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="catlink_gw_")
@@ -812,33 +856,6 @@ class RezeroAndLateReportTests(unittest.TestCase):
         for _ in range(6):
             self.feed(gs, 3.10)                                # refill reads true
         self.assertEqual((gs.state["litter_weight"], gs._litter_offset), (3.10, 0.0))
-
-    def report(self, gs, mm, ss, kg, cg):
-        gs.on_visit(bytes([1, 3, mm, ss, kg, cg]))
-
-    def test_late_report_after_an_interrupted_cycle(self):
-        gs = gwmod.GatewayState(self.visits, cats=[("cat_a", 3.2), ("cat_b", 4.6)],
-                                cats_file=os.path.join(self.dir, "cats.json"))
-        for _ in range(3):
-            self.feed(gs, 0.10)
-        for scale in (3.30, 3.31, 3.30):
-            self.feed(gs, scale, occupied=True)
-        self.report(gs, 2, 0, 3, 45)                           # normal: reported while the visit is open
-        self.feed(gs, 0.14)
-        self.assertEqual([v["cat"] for v in gs.recent_visits], ["cat_a"])
-        self.feed(gs, 0.12, state="cleaning")
-        self.feed(gs, 1.20, occupied=True, state="interrupted")   # a cat steps into the running cycle
-        self.feed(gs, 1.05, state="cleaning")
-        self.feed(gs, 1.15)                                    # cycle done; no report yet
-        self.assertEqual(len(gs.recent_visits), 1)
-        self.report(gs, 0, 40, 0, 95)                          # the late report
-        last = gs.recent_visits[-1]
-        self.assertEqual((last["cat"], last["deposit"], last.get("during_clean")), ("unknown", 0, True))
-        self.assertEqual(gs.state["last_deposit_weight"], 0)
-        self.feed(gs, 4.60, occupied=True)                     # a later occupancy with no report of its own
-        self.feed(gs, 0.12)
-        self.assertEqual(len(gs.recent_visits), 2)             # the late report never attaches to it
-        self.assertEqual(len(gs.cats.samples["cat_b"]), 0)
 
     def test_command_reply_is_a_known_frame(self):
         self.assertIn(0x015A, gwmod.COMMAND_CODES)
@@ -988,9 +1005,9 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(res.returncode, 2)
         self.assertIn("CATLINK_ALLOW_ANY_BIND", res.stderr)
 
-    def test_three_cats_refused(self):
+    def test_too_many_cats_refused(self):
         res = self.run_gateway(CATLINK_BOX_MAC=v.TEST_MAC, CATLINK_BOX_BIND_IP="127.0.0.1",
-                               CATLINK_CATS="cat_a=2.0,cat_b=2.4,cat_c=3.0")
+                               CATLINK_CATS="cat_a=2.0,cat_b=2.4,cat_c=3.0,cat_d=3.5")
         self.assertEqual(res.returncode, 2)
         self.assertIn("CATLINK_CATS", res.stderr)
 

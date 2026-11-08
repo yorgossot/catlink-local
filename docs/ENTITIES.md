@@ -16,8 +16,8 @@ is authoritative.
 
 "measurement" in the tables below means the discovery config sets `state_class: measurement`, so Home
 Assistant keeps long-term statistics (history graphs beyond the recorder window) for that sensor. It is set
-only on numeric readings: the weights, the deposit, the live scale, the litter weight and the Wi-Fi signal; never on counters
-or text.
+only on numeric readings: the weights, the deposit, the live scale, the litter weight, the Wi-Fi signal and the
+24-hour visit counts. The ever-growing visit counters are `total_increasing`; text never has a state class.
 
 ## MQTT topics
 
@@ -27,10 +27,11 @@ or text.
 | `BASE/state` | yes | JSON, keys below |
 | `BASE/diag` | yes | JSON, keys below |
 | `BASE/visits` | yes | `{"recent_visits":[…]}`, newest first, at most 15 |
+| `BASE/cats` | yes | JSON, cat keys below (only with `CATLINK_CATS`); published when a value changes, never per heartbeat |
 | `BASE/<object_id>/set` | no | commands from HA. A retained message on these topics is dropped, never acted on |
 | `PREFIX/<component>/NODE/<object_id>/config` | yes | discovery |
-| `BASE/correct_last/set` | no | gateway-internal, payload a cat slug (only with `CATLINK_CATS`) |
-| `BASE/set_ref_<slug>/set` | no | gateway-internal, payload kg (only with `CATLINK_CATS`) |
+| `BASE/correct_last/set` | no | gateway-internal, payload a cat slug or `unknown`: the newest visit was this cat (only with `CATLINK_CATS`) |
+| `BASE/set_ref_<slug>/set` | no | gateway-internal, payload kg: a kitchen-scale weigh-in (only with `CATLINK_CATS`) |
 | `BASE/litter_reset/set` | no | gateway-internal, payload `PRESS`: drop the litter re-zero offset |
 
 The gateway-internal topics are handled inside the gateway and never reach the box. They are subscribed
@@ -75,9 +76,11 @@ topic write homeassistant/+/catlink_litterbox/#
 | sensor | unmapped_changed_at | Unmapped bytes changed | `sensor.catlink_open_x_unmapped_bytes_changed` | diagnostic, from `BASE/diag` |
 | sensor | unmapped_change_count | Unmapped change count | `sensor.catlink_open_x_unmapped_change_count` | diagnostic, from `BASE/diag` |
 | sensor | last_unknown_command | Last unknown frame | `sensor.catlink_open_x_last_unknown_frame` | diagnostic, from `BASE/diag` |
+| sensor | last_visit_peak | Last visit box report | `sensor.catlink_open_x_last_visit_box_report` | weight, kg, diagnostic |
 
-`last_visit_weight` first shows the box's own (max-hold) value, then the settled estimate once the visit
-is finalised. See [PROTOCOL.md](PROTOCOL.md) §5.
+`last_visit_weight` is the weight measured from the live readings once the visit is finalised (unknown when
+no plateau could be measured); the box's own visit report is `last_visit_peak`, which is not a reliable
+weight. See [DESIGN.md](DESIGN.md) "Visit weight and deposit" and [PROTOCOL.md](PROTOCOL.md) §5.
 
 ## Command half (`CATLINK_COMMANDS=1` only)
 
@@ -113,20 +116,39 @@ box out of it.
 
 ## Cat entities (`CATLINK_CATS` set)
 
-Shown for slug `cat_a`; one set per configured cat. The display name is the slug with `_` → space,
-first letter capitalised (`cat_a` → "Cat a").
+Shown for slug `cat_a`; one set per configured cat. The display name is the slug with `_` → space, first
+letter capitalised (`cat_a` → "Cat a"). Every cat entity reads the retained `BASE/cats` topic.
 
 | Component | object_id | Name | Entity id (default device name) | Class / unit / category |
 |---|---|---|---|---|
-| sensor | `<slug>_weight` | `<Display> weight` | `sensor.catlink_open_x_cat_a_weight` | weight, kg, measurement; json_attributes = `BASE/state` |
-| sensor | `<slug>_trend_7d` | `<Display> trend 7d` | `sensor.catlink_open_x_cat_a_trend_7d` | g, diagnostic |
-| sensor | cat_gap (2 cats only) | Cat gap | `sensor.catlink_open_x_cat_gap` | g, diagnostic |
-| sensor | last_visit_cat | Last visit cat | `sensor.catlink_open_x_last_visit_cat` | text such as `Cat a 82%`; json_attributes = `BASE/state` |
-| sensor | labelled_pct | Labelled pct | `sensor.catlink_open_x_labelled_pct` | %, diagnostic |
+| sensor | `<slug>_weight` | `<Display> weight` | `sensor.catlink_open_x_cat_a_weight` | weight, kg, measurement; json_attributes = `BASE/cats`. Unknown while the tracker cannot stand behind a weight (see `<slug>_stale_reason`) |
+| sensor | `<slug>_weight_lo` | `<Display> weight low` | `sensor.catlink_open_x_cat_a_weight_low` | weight, kg, measurement: the weight − 2 sd |
+| sensor | `<slug>_weight_hi` | `<Display> weight high` | `sensor.catlink_open_x_cat_a_weight_high` | weight, kg, measurement: the weight + 2 sd |
+| sensor | `<slug>_stale_reason` | `<Display> weight status` | `sensor.catlink_open_x_cat_a_weight_status` | text: OK / Not seen for 3 days / Not seen yet / Not identified: weigh every cat / Weight changed suddenly: weigh every cat / Unknown / unavailable |
+| sensor | `<slug>_trend_7d` | `<Display> growth` | `sensor.catlink_open_x_cat_a_growth` | g/wk, diagnostic (the object id is kept from 0.1) |
+| sensor | `<slug>_visits` | `<Display> visits` | `sensor.catlink_open_x_cat_a_visits` | total_increasing |
+| sensor | `<slug>_visits_24h` | `<Display> visits 24h` | `sensor.catlink_open_x_cat_a_visits_24h` | measurement |
+| sensor | `<slug>_last_seen` | `<Display> last seen` | `sensor.catlink_open_x_cat_a_last_seen` | timestamp |
+| sensor | `<slug>_last_weigh_in` | `<Display> last weigh-in` | `sensor.catlink_open_x_cat_a_last_weigh_in` | text: `accepted` / `pending` / `rejected` + kg + time + reason; `none yet` |
+| sensor | cat_status | Cat ID status | `sensor.catlink_open_x_cat_id_status` | text: OK / Learning the cats / Can't tell them apart / Weigh every cat / unavailable; json_attributes = `BASE/cats` |
+| sensor | cat_gap (2+ cats) | Cat gap | `sensor.catlink_open_x_cat_gap` | g, diagnostic: the smallest gap between published weights |
+| sensor | cluster_low (2+ cats) | Lightest cat cluster | `sensor.catlink_open_x_lightest_cat_cluster` | weight, kg: what the box sees, without names |
+| sensor | cluster_high (2+ cats) | Heaviest cat cluster | `sensor.catlink_open_x_heaviest_cat_cluster` | weight, kg |
+| sensor | cluster_low_n, cluster_high_n (2+ cats) | Lightest / Heaviest cluster visits | `sensor.catlink_open_x_lightest_cluster_visits` | diagnostic |
+| sensor | visits_24h_total | Visits 24h | `sensor.catlink_open_x_visits_24h` | measurement, diagnostic |
+| sensor | scale_shift | Scale shift | `sensor.catlink_open_x_scale_shift` | diagnostic: `none`, or e.g. `scale_shift +52 g <time>` for 72 h after every cat's reading moved together |
+| sensor | readings_above_window_24h | Readings above window 24h | `sensor.catlink_open_x_readings_above_window_24h` | diagnostic |
+| sensor | last_visit_cat | Last visit cat | `sensor.catlink_open_x_last_visit_cat` | text such as `Cat a 94%`, `Unknown`, `Cat a + Cat b`; json_attributes = `BASE/cats` |
+| sensor | labelled_pct | Labelled 7d | `sensor.catlink_open_x_labelled_7d` | %, diagnostic |
 | sensor | correction_count | Correction count | `sensor.catlink_open_x_correction_count` | diagnostic |
+| sensor | unknown_visits | Unknown visits | `sensor.catlink_open_x_unknown_visits` | total_increasing, diagnostic |
+| sensor | two_cat_visits (2+ cats) | Two-cat visits | `sensor.catlink_open_x_two_cat_visits` | total_increasing, diagnostic |
 
-Because the weight sensors carry `BASE/state` as attributes, a dashboard can read
-`state_attr('sensor.catlink_open_x_cat_a_weight', 'cat_a_trend_word')`.
+The object ids of 0.1 (`<slug>_weight`, `<slug>_trend_7d`, `cat_gap`, `last_visit_cat`, `labelled_pct`,
+`correction_count`) are kept, so on an upgrade Home Assistant keeps their entity ids (e.g.
+`sensor.catlink_open_x_cat_a_trend_7d`, `sensor.catlink_open_x_labelled_pct`) and only updates their names;
+the ids in the table are what a fresh install mints. Because the weight, status and last-visit sensors carry `BASE/cats` as attributes, a dashboard can
+read e.g. `state_attr('sensor.catlink_open_x_cat_a_weight', 'cat_a_trend_word')` or `'cat_status'`.
 
 ## `BASE/state` keys
 
@@ -150,26 +172,45 @@ Because the weight sensors carry `BASE/state` as attributes, a dashboard can rea
 | drawer_out | bool | true = out |
 | wifi_signal | int | dBm |
 | box_clock | string | `HH:MM`, the box's own (unset) clock |
-| last_visit_weight | float | kg |
+| last_visit_weight | float or null | kg, measured from the live readings; null when no plateau could be measured |
+| last_visit_peak | float or null | kg, the box's own visit report (not a weight) |
 | last_visit_duration | string | `m:ss` |
 | last_visit_seconds | int | |
 | last_visit_at | string | ISO timestamp |
-| last_deposit_weight | int | g |
+| last_deposit_weight | int or null | g; null = implausible (more than 300 g), unknown |
 
-With cats configured, also:
+## `BASE/cats` keys (with `CATLINK_CATS`)
+
+Per cat (`<slug>_…`):
 
 | Key | Notes |
 |---|---|
-| `<slug>_weight` | kg, median of recent confident visits |
-| `<slug>_trend_7d` | g, last 7 days vs the 7 before |
-| `<slug>_trend_word` | gaining / losing / steady |
-| cat_gap | g (2 cats) |
-| labelled_pct | % of visits given a cat label |
-| correction_count | |
-| cat_degraded | bool (2 cats); references too close to tell apart |
-| last_cat | slug or `unknown` |
-| last_conf | int % |
-| last_visit_cat | e.g. `Cat a 82%` |
+| `<slug>_weight` | kg or null: the track's prediction for now; null = not published (see `_stale_reason`). A seed is never published |
+| `<slug>_weight_unc_g` | g, 1 sd |
+| `<slug>_weight_lo_kg`, `<slug>_weight_hi_kg` | kg, ±2 sd |
+| `<slug>_growth_g_week` | g/week or null |
+| `<slug>_trend_word` | gaining / losing / steady / not enough data |
+| `<slug>_last_seen` | ISO timestamp of the last labelled visit |
+| `<slug>_stale` | bool: no labelled visit or accepted weigh-in for 72 h |
+| `<slug>_stale_reason` | null (weight published), `not_seen`, `not_identified`, `sudden_change`, `unavailable` |
+| `<slug>_visits_total`, `<slug>_visits_24h` | int |
+| `<slug>_last_weigh_in` | text or null, e.g. `rejected 3.30 kg 2030-01-07T09:15: … enter it again changed by 0.01 kg (e.g. 3.31 for 3.30) within 24 h to confirm` |
+
+Global:
+
+| Key | Notes |
+|---|---|
+| cat_status | `ok`, `learning`, `cant_tell_apart`, `needs_weigh_in`; `unavailable` if the tracker failed |
+| cat_gap | g or null: smallest gap between two published weights |
+| labelled_pct_7d | % of the last 7 days' plateaus given a cat label |
+| visits_24h_total | int |
+| unknown_visits_total, two_cat_visits_total, correction_count | int |
+| cluster_low_kg, cluster_high_kg, cluster_low_n, cluster_high_n | the label-free clusters (2+ cats), or null |
+| scale_shift | null or `scale_shift <±g> g <time>` |
+| readings_above_window_24h | int |
+| last_cat | slug, `unknown`, `two_cats` or null |
+| last_conf | int % or null |
+| last_visit_cat | e.g. `Cat a 94%`, `Unknown`, `Cat a + Cat b` |
 
 ## `BASE/diag` keys
 
@@ -187,16 +228,26 @@ With cats configured, also:
 ## `recent_visits` rows
 
 ```json
-{"time": "Jan 7 09:15", "peak": 3.21, "duration": "1m 42s", "weight": 3.05, "deposit": 40,
- "cat": "cat_a", "conf": 82}
+{"time": "Jan 7 09:15", "ts": "2030-01-07T09:15:42+00:00", "peak": 3.21, "duration": "1m 42s",
+ "weight": 3.05, "deposit": 40, "source": "box", "kind": "plateau", "n": 6, "pre": 1.48,
+ "baseline_unc": 0.02, "cat": "cat_a", "conf": 94}
 ```
 
 | Field | Notes |
 |---|---|
 | time | local time, display string |
-| peak | kg, the box's max-hold visit weight |
-| duration | display string |
-| weight | kg, settled estimate |
-| deposit | g |
-| cat | slug or `unknown`; only with `CATLINK_CATS` |
-| conf | int %; only with `CATLINK_CATS` |
+| ts | ISO timestamp of the visit's end (rows of 0.1 have none) |
+| peak | kg, the box's own visit report; null for a `gateway` row |
+| peaks | two reports for one occupancy (two cats) |
+| duration | display string: the box's reported duration, or the occupancy's for a `gateway` row |
+| weight | kg, the plateau median minus the pre-visit baseline; null = not measured (no plateau, a tie, two cats, during a clean) |
+| weights | two cats in one occupancy: both weights, in order |
+| deposit | g; null = unknown (more than 300 g, or the visit was held open to the 10-minute cap) |
+| source | `box` (the box reported it) or `gateway` (an occupancy the box never reported) |
+| kind | `plateau`, `single` (one live reading), `two` (two plateaus) or `none` |
+| n | readings in the weighed plateau (two numbers for two cats) |
+| pre, baseline_unc | the pre-visit empty baseline and the spread of the readings it came from, kg |
+| clamped, during_clean, held, tie, baseline_alt, upgraded_from, segments_merged, baseline_ambiguous | present only when they apply (see DESIGN.md) |
+| cat | slug, `unknown` or `two_cats`; only with `CATLINK_CATS` |
+| cats | the two slugs of a `two_cats` row |
+| conf | int % (at most 99) or null; only with `CATLINK_CATS` |

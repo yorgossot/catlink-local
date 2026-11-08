@@ -36,13 +36,16 @@ carries a confidence tag (confirmed, observed, hypothesis or unverified), and ma
 
 What works:
 - heartbeat decode: state, occupancy, live scale, mode, litter type, settings, box clock, Wi-Fi RSSI
-- visits: count, duration, weight (box value and a settled estimate), deposit estimate
+- visits: count, duration, weight (measured from the live scale readings; the box's own value is kept
+  apart), deposit estimate, two cats in one visit, visits the box never reported
 - waste bin full, waste drawer out
 - litter weight in the drum, and an example "litter low" alarm built on it (the box itself has no
   litter-level sensor; [examples/homeassistant/litter_low.yaml](examples/homeassistant/litter_low.yaml))
 - commands (off by default): clean, level, pause, resume, cancel; mode (automatic/manual), litter type,
   clean delay, burial delay, light, sound, continuous cleaning, soft-stool burial, child lock, kitty mode
-- optional weight-based labelling of visits for one or two cats (off by default)
+- optional cat identification and weight tracking for 1 to 3 cats (off by default): visits are named only
+  when the weight makes it likely, each cat's weight and growth is tracked, and when the box cannot tell the
+  cats apart it says so and asks for a kitchen-scale weigh-in ([docs/DESIGN.md](docs/DESIGN.md))
 
 What does not:
 - **scheduled** mode cannot be set (it needs a slot table the gateway will not invent); night mode is

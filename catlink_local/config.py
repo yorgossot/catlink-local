@@ -17,10 +17,10 @@ MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 SLUG_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 NODE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
-MAX_CATS = 2
-# A slug becomes object ids <slug>_weight / <slug>_trend_7d and the label "unknown" is taken: refuse the
-# slugs that would collide with an existing entity or label.
-RESERVED_SLUGS = {"unknown", "last_visit", "last_deposit"}
+MAX_CATS = 3          # the tracker is generic in N; 3 is the most its tests cover
+# A slug becomes object ids / state keys <slug>_weight, <slug>_visits, ... and the labels "unknown" / "two_cats"
+# are taken: refuse the slugs that would collide with an existing entity, state key or label.
+RESERVED_SLUGS = {"unknown", "last_visit", "last_deposit", "two_cat", "two_cats"}
 CAT_SEED_MIN_KG = 0.2
 CAT_SEED_MAX_KG = 12.0
 DEFAULT_STATE_DIR = "/var/lib/catlink-local"
@@ -81,7 +81,8 @@ def parse_mac(value, name="CATLINK_BOX_MAC"):
 
 
 def parse_cats(value):
-    """'slug=kg[,slug=kg]' -> [(slug, kg), ...] in the given order (lighter first). '' -> []."""
+    """'slug=kg[,slug=kg...]' -> [(slug, kg), ...] in the given order. '' -> []. The weights are rough seeds
+    (a kitchen-scale guess is fine); they are never published as a cat's weight."""
     value = (value or "").strip()
     if not value:
         return []
@@ -92,7 +93,7 @@ def parse_cats(value):
         slug, kg = slug.strip(), kg.strip()
         if not sep or not SLUG_RE.match(slug) or slug in RESERVED_SLUGS:
             raise ConfigError("CATLINK_CATS entries must be slug=kg with slug [a-z][a-z0-9_]* "
-                              "(not unknown/last_visit/last_deposit)")
+                              "(not unknown/last_visit/last_deposit/two_cat/two_cats)")
         try:
             seed = round(float(kg), 3)
         except ValueError:
@@ -105,8 +106,6 @@ def parse_cats(value):
         raise ConfigError("CATLINK_CATS supports at most %d cats" % MAX_CATS)
     if len({slug for slug, _ in cats}) != len(cats):
         raise ConfigError("CATLINK_CATS slugs must be unique")
-    if len(cats) == 2 and not cats[0][1] < cats[1][1]:
-        raise ConfigError("CATLINK_CATS must list the lighter cat first")
     return cats
 
 

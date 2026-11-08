@@ -162,12 +162,16 @@ Synthetic example: `01 03 01 2a 03 15` = 1:42, 3.21 kg.
 
 - **Duration** is `mm ss`. Reading bytes 2–3 as one big-endian number of seconds (as the reference
   project does) puts visit starts at moments when the occupancy flag was off and the scale flat.
-- **Weight behaves like a max-hold.** It was never below a sampled live-scale value and rarely matched
-  "peak minus empty baseline". Jumps, landings and a hand on the box inflate
-  it. The gateway publishes it as-is, then replaces it with a settled estimate (below).
-- **Settled weight**: the median of the genuine cat-on-scale heartbeat samples during the visit (at least
-  `0.15` kg above the baseline), minus the pre-visit empty baseline. Falls back to the box value with fewer
-  than 2 samples.
+- **Weight is not a reliable weight.** Early observations looked like a max-hold (jumps, landings and a hand
+  on the box inflate it), but over a longer series it was within ±30 g of the cat only about a third of the
+  time, often 100 g or more high, and sometimes far *below* the cat. The gateway publishes it only as
+  `last_visit_peak` (the row's `peak`) and uses it as a cross-check.
+- **Visit weight**: the median of the largest plateau of live cat-on-scale heartbeat readings during the
+  visit (at least `0.15` kg above the baseline, inside the tracker's whole-one-cat window), minus the
+  pre-visit empty baseline; no plateau, no weight. See [DESIGN.md](DESIGN.md) "Visit weight and deposit".
+- **Timing**: the report arrives at the cat's exit; the occupancy flag runs 7–32 s longer than the reported
+  duration, and after a cat stepped into a running clean cycle the report came 40–50 s after the occupancy
+  ended.
 - **Deposit estimate**: the shift in the empty baseline across the visit. Below 30 g it is reported as 0
   (scale noise). A higher empty level after a litter top-up is adopted only after 3 consecutive idle,
   unoccupied heartbeats agree within 0.10 kg. A deposit of a few tens of grams can show up as a baseline
@@ -248,7 +252,7 @@ same topic.
 | Host names used | vendor names | only the `-x` variants |
 | Login | `/auth/devicename`, needs the vendor's HTTPS | `/auth/bootstrap` too; a local self-signed responder is accepted |
 | Occupancy | offsets 42, 44 | offset 8; 42 and 44 read 0 |
-| Scale | needs per-box calibration | empty reads the litter load; box visit weight is a max-hold |
+| Scale | needs per-box calibration | empty reads the litter load; the box's visit weight is not reliable |
 
 ## 9. Mapping a new byte
 

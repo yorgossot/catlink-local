@@ -39,7 +39,9 @@ Configuration: CATLINK_* environment variables, see config.py and config/catlink
 import collections
 import datetime
 import errno
+import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -51,7 +53,7 @@ import time
 
 from . import __version__
 from . import config as config_mod
-from .cats import CatTracker, display_name
+from .cats import CatTracker, display_name, v2_path_for
 from .log import configure as configure_log
 from .log import log
 from .mqtt_min import MAX_PACKET, HaMqtt, encode_length
@@ -70,7 +72,7 @@ DISCOVERY_PREFIX = "homeassistant"
 BASE = "catlink/litterbox"
 NODE = "catlink_litterbox"
 DEVICE = {}
-AVAIL_TOPIC = STATE_TOPIC = DIAG_TOPIC = VISITS_TOPIC = None
+AVAIL_TOPIC = STATE_TOPIC = DIAG_TOPIC = VISITS_TOPIC = CATS_TOPIC = None
 CAT_COMMANDS = set()
 
 VISITS_KEEP = 15
@@ -100,36 +102,10 @@ EMPTY_SAMPLES = 10
 MIN_EMPTY_SAMPLES = 2
 OFFLINE_AFTER_S = 300  # HA availability flips to offline if no fresh box heartbeat within this
 
-# Deposit / visit-weight decode guards (see docs/DESIGN.md). The box scale resolves 10 g and the
-# occupancy flag lags the scale by ~1 heartbeat (~3 s) at both entry and exit. These constants defend the
-# empty-scale baseline, the deposit, and the visit weight against that lag and against sub-noise
-# readings. Pure STATE/DECODE; no effect on the box side.
-EMPTY_BASELINE_MAX_JUMP = 0.15   # kg: a new "empty" baseline that jumps > this ABOVE the current one is
-                                 # NOT accepted outright (a cat on the scale while occupied=0). Also the
-                                 # floor a sample must clear ABOVE the baseline to count as a genuine
-                                 # cat-on-scale reading.
-DEPOSIT_NOISE_FLOOR_G = 30       # g: a computed deposit below this is at/under the scale noise floor -> 0
-RELITTER_CONFIRM_SAMPLES = 3     # a higher empty level is adopted as the baseline only after this many
-RELITTER_TOLERANCE_KG = 0.10     # consecutive idle+unoccupied heartbeats agree within this (a real litter
-                                 # top-up persists; a one-off cat-on-scale lag reading does not).
-LITTER_WEIGHT_SAMPLES = 5        # litter_weight = median of the last N trusted empty baselines ...
-LITTER_WEIGHT_MIN_SAMPLES = 3    # ... published once at least this many exist (a few minutes after start)
-MIN_SETTLED_SAMPLES = 2          # settled visit weight = MEDIAN of the genuine cat-on-scale samples (robust
-                                 # to a partial-support low sample); fall back to the box peak below this.
-LATE_REPORT_GRACE_S = 180        # a visit report arriving this soon after its occupancy closed is paired with
-                                 # it (seen 40-50 s late when a cat stepped into a running clean cycle)
-# The box re-zeroes its scale at power-up WITH the litter in it (a power-cycle took the empty scale from
-# ~3.4 kg to 0.00). litter_weight therefore carries an offset across a re-zero: the first trusted empty
-# reading of a NEW box session that sits near 0 while the last known litter weight was substantial. Within
-# one session a low reading is never treated as a re-zero.
-LITTER_REZERO_MIN_PREV = 1.0     # kg: last known litter weight at/above this ...
-LITTER_REZERO_MAX_NOW = 0.30     # kg: ... and the new session's first empty reading at/under this = re-zero
-
-
 def configure(cfg):
     """Install a validated config (config.load('gateway')) into the module globals."""
     global CFG, BOX_BIND, BOX_MAC_BYTES, COMMANDS_ENABLED, DISCOVERY_PREFIX, BASE, NODE, DEVICE
-    global AVAIL_TOPIC, STATE_TOPIC, DIAG_TOPIC, VISITS_TOPIC, CAT_COMMANDS
+    global AVAIL_TOPIC, STATE_TOPIC, DIAG_TOPIC, VISITS_TOPIC, CATS_TOPIC, CAT_COMMANDS
     CFG = cfg
     BOX_BIND = (cfg.box_bind_ip, cfg.box_bind_port)
     BOX_MAC_BYTES = cfg.box_mac_bytes
@@ -143,6 +119,7 @@ def configure(cfg):
     STATE_TOPIC = BASE + "/state"
     DIAG_TOPIC = BASE + "/diag"
     VISITS_TOPIC = BASE + "/visits"      # json_attributes source for the visit_count sensor (recent_visits)
+    CATS_TOPIC = BASE + "/cats"          # the cat entities' state + attributes: retained, published on change
     # Gateway-internal commands; they never reach the box. The cat ones exist only when CATLINK_CATS is set.
     CAT_COMMANDS = ({"correct_last"} | {"set_ref_" + slug for slug, _ in cfg.cats}) if cfg.cats else set()
     CAT_COMMANDS = CAT_COMMANDS | {"litter_reset"}
@@ -196,6 +173,251 @@ def client_id_summary(client_id):
             "client_params": {k: params[k] for k in CLIENT_PARAMS_LOGGED if k in params}}
 
 
+# Visit / deposit / baseline guards (see docs/DESIGN.md). The box scale resolves 10 g and the occupancy flag lags
+# the scale by about one heartbeat at entry and exit. Pure STATE/DECODE; no effect on the box side.
+EMPTY_BASELINE_MAX_JUMP = 0.15   # kg: a new "empty" reading more than this ABOVE the baseline is not accepted
+                                 # outright (a cat on the scale while occupied=0). Also the floor a reading must
+                                 # clear above the baseline to count as a cat-on-scale sample, and the level above
+                                 # which an unoccupied reading keeps a visit open (the cat is still on the scale).
+BASELINE_EMPTIES = 3             # pre-visit baseline = median of the last N trusted empty readings since the
+                                 # last clean cycle / visit (one reading moves 60-130 g with the drum position)
+BASELINE_DROP_KG = 0.10          # an empty reading more than this BELOW the baseline needs ...
+BASELINE_DROP_CONFIRM = 2        # ... this many consecutive readings that agree within ...
+BASELINE_DROP_AGREE_KG = 0.05    # ... this, before it is adopted (one-off low readings happen)
+BASELINE_CLAMP_KG = 0.005        # pre-visit baseline at/under this = the scale may be clamped at 0.00 (flagged)
+DEPOSIT_NOISE_FLOOR_G = 30       # g: a computed deposit below this is at/under the scale noise floor -> 0
+DEPOSIT_MAX_G = 300              # g: a computed deposit above this is not a deposit (cat still on, drum moved,
+                                 # litter added) -> published as None (unknown), and logged
+RELITTER_CONFIRM_SAMPLES = 3     # a higher empty level is adopted as the baseline only after this many
+RELITTER_TOLERANCE_KG = 0.10     # consecutive idle+unoccupied heartbeats agree within this (a real litter
+                                 # top-up persists; a one-off cat-on-scale lag reading does not).
+LITTER_WEIGHT_SAMPLES = 5        # litter_weight = median of the last N trusted empty baselines ...
+LITTER_WEIGHT_MIN_SAMPLES = 3    # ... published once at least this many exist (a few minutes after start)
+# Per-visit weight. The box's own visit report (`01 03 mm ss kg cg`) is NOT a reliable weight: on a real box it was
+# within +-30 g of the cat only about a third of the time, often 100 g or more high and sometimes far LOW. It is
+# kept as `peak` (informational, last_visit_peak) and as a cross-check for a single live reading only.
+CLUSTER_WIDTH_KG = 0.05          # a plateau = live samples within this of each other (in-visit sd is ~9 g)
+TWO_CAT_MIN_SAMPLES = 2          # two plateaus with at least this many samples each ...
+TWO_CAT_MIN_GAP_KG = 0.12        # ... and at least this far apart = two cats in one occupancy (two segments)
+VISIT_HOLD_MAX_S = 600           # an unoccupied reading still > baseline+0.15 keeps the visit open (the occupancy
+                                 # flag can flap while the cat sits still); after this long it is closed (weight
+                                 # from the occupied samples, no deposit) ...
+VISIT_HOLD_AGREE_KG = 0.02       # ... or earlier, when 2 consecutive held readings agree within this AND the
+VISIT_HOLD_NOT_CAT_MARGIN_KG = 0.30  # level is this far below the whole-cat window: the new empty level (a big
+                                 # deposit / litter added), not a cat sitting still with the flag off
+PAIR_BIAS_S = 20                 # an occupancy runs this much longer than the box's own visit duration (7-32 s
+                                 # in every real pairing observed); used when pairing a report with an occupancy
+PAIR_OPEN_MIN_S = -15            # a report goes to the open occupancy (no report yet) when its span minus the
+PAIR_OPEN_MAX_S = 60             # report's duration is within these; otherwise the closest candidate by score
+PAIR_SCORE_MAX_S = 45            # a closed occupancy takes a report only with a pairing score at/under this
+REPORT_OVERLAP_S = 30            # a late report upgrades a gateway row only if its visit started by row end + this
+TWO_REPORT_AGREE_KG = 0.08       # two reports in one occupancy count as two cats' total only if each is within
+                                 # this of its own plateau (else a perched same cat looks like two cats)
+REPORT_DUP_S = 5                 # an identical box report within this many seconds is a redelivery (ignored)
+REPORT_UPGRADE_S = 30            # an unpairable late report whose duration matches (+- this, around the bias) ...
+REPORT_UPGRADE_WINDOW_S = 600    # ... a gateway-sourced row that ended within this IS that visit (upgraded)
+GATEWAY_VISIT_MIN_S = 60         # an occupancy the box never reports becomes a gateway-sourced visit when it
+GATEWAY_VISIT_MIN_SAMPLES = 2    # lasted this long, has a plateau of this many samples, saw no clean cycle,
+                                 # and no report arrived within LATE_REPORT_GRACE_S of its close
+LATE_REPORT_GRACE_S = 180        # a box visit report arriving this soon after an occupancy closed may be paired
+                                 # with it (seen 40-50 s late when a cat stepped into a running clean cycle)
+NO_CATS_WINDOW_KG = (0.5, 15.0)  # the whole-one-cat window when no cats are configured (no tracker)
+# The box re-zeroes its scale at power-up WITH the litter in it (a power-cycle took the empty scale from ~3.4 kg
+# to 0.00), so litter_weight carries an offset across a re-zero. It is checked ONCE per box session, on the first
+# 2 agreeing idle+empty readings: a re-zero = they sit near 0, the last known litter weight was substantial, AND
+# the raw reading actually dropped (a reconnect or a gateway restart does not re-anchor the offset).
+LITTER_REZERO_MIN_PREV = 1.0     # kg: last known litter weight at/above this ...
+LITTER_REZERO_MAX_NOW = 0.30     # kg: ... and the new session's empty reading at/under this ...
+LITTER_REZERO_MIN_DROP = 1.0     # kg: ... and at least this far below the raw level the offset predicts
+LITTER_REZERO_AGREE_KG = 0.03    # kg: the two session readings that decide must agree within this
+
+# Sanity ranges for values read back from a state file (anything else = a corrupt file, quarantined).
+STATE_W_MAX = 15.0               # kg
+
+
+# ====================================================================================================
+# STATE FILES -- atomic + fsync; a corrupt file is moved aside (.corrupt-<ts>) and logged, never silently
+# replaced. All under the StateDirectory; best-effort, never raises into the caller.
+# ====================================================================================================
+def _atomic_write(path, text_):
+    """Write `text_` to `path` via tmp + fsync + rename + directory fsync (power cuts)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write(text_)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    try:
+        dfd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _quarantine(path, what, error):
+    """A state file that does not parse is renamed <path>.corrupt-<ts> (kept for inspection) and logged."""
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = "%s.corrupt-%s" % (path, stamp)
+    try:
+        os.replace(path, dest)
+        log("state_file_corrupt", file=what, moved_to=os.path.basename(dest), error=error)
+    except OSError as exc:
+        log("state_file_corrupt", file=what, moved_to=None, error=error, rename_error=type(exc).__name__)
+
+
+def _fnum_range(value, lo, hi, what="number"):
+    """A finite real number within [lo, hi] (bools, strings, NaN, +-inf, 1e999, huge ints -> ValueError)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("bad_" + what)
+    try:
+        v = float(value)
+    except (OverflowError, ValueError):
+        raise ValueError("bad_" + what) from None
+    if not math.isfinite(v) or not lo <= v <= hi:
+        raise ValueError("bad_" + what)
+    return v
+
+
+def _num_or_none(value, lo, hi):
+    try:
+        return _fnum_range(value, lo, hi)
+    except ValueError:
+        return None
+
+
+def _json_safe(obj, depth=0):
+    """Replace non-finite floats (NaN/inf would be invalid JSON for HA) with None; cap pathological depth."""
+    if depth > 20:
+        return None
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v, depth + 1) for v in obj]
+    return obj
+
+
+def _finite_tree(obj, depth=0):
+    """True if a parsed JSON value has no NaN/inf anywhere and is not pathologically deep."""
+    if depth > 20:
+        return False
+    if isinstance(obj, float):
+        return math.isfinite(obj)
+    if isinstance(obj, dict):
+        return all(_finite_tree(v, depth + 1) for v in obj.values())
+    if isinstance(obj, list):
+        return all(_finite_tree(v, depth + 1) for v in obj)
+    return True
+
+
+def _row_seconds(row):
+    """A visit row's duration "Xm YYs" -> seconds, or None."""
+    m = re.match(r"^(\d+)m (\d+)s$", str(row.get("duration", "")))
+    return int(m.group(1)) * 60 + int(m.group(2)) if m else None
+
+
+def _row_epoch(row):
+    """A visit row's ISO `ts` -> epoch, or None (rows written by 0.1 have no ts)."""
+    try:
+        return datetime.datetime.fromisoformat(row["ts"]).timestamp()
+    except Exception:
+        return None
+
+
+_ENTER_AGAIN = re.compile(r"\benter (?:it )?again(?: changed by 0\.01 kg)?")
+
+
+def _ha_cat_fields(fields, cats):
+    """What the cat entities publish, from the tracker's fields (HA-side wording only; the tracker is untouched):
+      * HA's input_number helpers only send a CHANGED value (state trigger), so the tracker's "enter it again changed
+        by 0.01 kg" (its confirmation accepts any value within 50 g) is published with the example for this very
+        value: "enter it again changed by 0.01 kg (e.g. 2.31 for 2.30)"; applied once (idempotent);
+      * the tracker's error fallback (fields() could not compute; every counter None) publishes cat_status and the
+        stale reasons as "unavailable", never a status / "OK" it does not know."""
+    out = dict(fields)
+    for c in cats:
+        text_ = out.get(c + "_last_weigh_in")
+        if isinstance(text_, str) and _ENTER_AGAIN.search(text_) and "(e.g." not in text_:
+            m = re.match(r"^\S+ (\d+\.\d\d) kg", text_)
+            eg = "%.2f for %s" % (float(m.group(1)) + 0.01, m.group(1)) if m else "2.21 for 2.20"
+            out[c + "_last_weigh_in"] = _ENTER_AGAIN.sub("enter it again changed by 0.01 kg (e.g. %s)" % eg, text_)
+    if all(out.get(c + "_visits_total") is None for c in cats):
+        out["cat_status"] = "unavailable"
+        for c in cats:
+            out[c + "_stale_reason"] = "unavailable"
+    return out
+
+
+# ====================================================================================================
+# PER-VISIT OBSERVATION (pure): which live readings are one whole cat, and how many cats were there
+# ====================================================================================================
+def visit_segments(samples, lo, hi, peak=None):
+    """Turn one occupancy's live cat-on-scale readings into 0, 1 or 2 whole-cat segments. Pure.
+
+    samples: [(epoch, net_kg)] chronological, net of the pre-visit baseline. lo/hi: the tracker's whole-one-cat
+    window. Readings outside it (paws on the rim, a jump landing, both cats) never count. The rest are grouped
+    into plateaus (max width CLUSTER_WIDTH_KG); the visit weight is the median of the largest plateau. Two
+    plateaus with >= TWO_CAT_MIN_SAMPLES each, >= TWO_CAT_MIN_GAP_KG apart = two cats (chronological segments).
+    A tie between the two largest plateaus = no segment (unknown). All arithmetic in integer grams.
+    Returns (segments, info); a segment is {"w", "n", "spread", "peak_delta"} (kg; peak_delta = peak - w)."""
+    lo_g, hi_g = int(round(lo * 1000)), int(round(hi * 1000))
+    width_g = int(round(CLUSTER_WIDTH_KG * 1000))
+    pool = []
+    low = high = 0
+    for t, w in samples:
+        w_g = int(round(w * 1000))
+        if w_g < lo_g:
+            low += 1
+        elif w_g > hi_g:
+            high += 1
+        else:
+            pool.append((w_g, t))
+    clusters = []
+    while pool:
+        pool.sort()
+        best = None   # (count, -spread, -i) -> the most samples, then the tightest, then the lightest
+        j = 0
+        for i in range(len(pool)):
+            if j < i:
+                j = i
+            while j + 1 < len(pool) and pool[j + 1][0] - pool[i][0] <= width_g:
+                j += 1
+            key = (j - i + 1, -(pool[j][0] - pool[i][0]), -i)
+            if best is None or key > best[0]:
+                best = (key, i, j)
+        _, i, j = best
+        clusters.append(pool[i:j + 1])
+        pool = pool[:i] + pool[j + 1:]
+    info = {"kept": sum(len(c) for c in clusters), "below": low, "above": high,
+            "plateaus": [len(c) for c in clusters], "tie": False}
+
+    def seg(cluster):
+        ws = sorted(w for w, _ in cluster)
+        w = int(round(statistics.median(ws))) / 1000.0
+        return {"w": w, "n": len(ws), "spread": (ws[-1] - ws[0]) / 1000.0,
+                "peak_delta": None if peak is None else round(peak - w, 3), "_t": min(t for _, t in cluster)}
+
+    segments = []
+    if clusters:
+        first = clusters[0]
+        second = clusters[1] if len(clusters) > 1 else None
+        if second is not None and len(first) >= TWO_CAT_MIN_SAMPLES and len(second) >= TWO_CAT_MIN_SAMPLES and \
+                abs(statistics.median([w for w, _ in first]) - statistics.median([w for w, _ in second])) \
+                >= int(round(TWO_CAT_MIN_GAP_KG * 1000)):
+            segments = sorted([seg(first), seg(second)], key=lambda s: s["_t"])
+        elif second is not None and len(second) == len(first):
+            info["tie"] = True
+        else:
+            segments = [seg(first)]
+    for s in segments:
+        s.pop("_t", None)
+    return segments, info
+
+
 # ====================================================================================================
 # Shared gateway state (between the box threads and the HA bridge thread)
 # ====================================================================================================
@@ -204,7 +426,9 @@ class GatewayState:
 
     def __init__(self, visits_file, cats=(), cats_file=None, litter_file=None):
         self.visits_file = visits_file
+        self.cats_file = cats_file
         self.litter_file = litter_file
+        self.cat_config = [(slug, float(seed)) for slug, seed in cats]
         self.lock = threading.Lock()
         self.dirty = threading.Event()
         self.state = {}                      # HA-facing state dict
@@ -212,81 +436,192 @@ class GatewayState:
         self.last_heartbeat_at = None        # monotonic
         self.prev_unmapped = None
         self.unmapped_change_count = 0
-        # Deposit estimate: weight left behind on the most recent completed visit, from the change
-        # in the box's empty-scale baseline across the visit (the empty scale does not read 0).
-        self._empty_baseline = None          # last TRUSTED stable empty-scale reading, kg
-        self._pre_visit_baseline = None       # trusted empty baseline snapshotted when the cat entered, kg
-        self._prev_occupied = False
-        self._visit_open = False
-        self._occupied_samples = []           # genuine cat-on-scale readings this visit (settled = median)
-        self._high_candidate = None           # a sustained higher empty level under confirmation, kg
-        self._high_count = 0                  # consecutive idle+unoccupied readings agreeing with it
+        # Empty-scale baseline (litter level) and the per-visit pre-visit baseline.
+        self._empty_baseline = None          # TRUSTED empty level, kg: median of _empties (guard reference)
+        self._empties = collections.deque(maxlen=BASELINE_EMPTIES)  # trusted readings since the last clean/visit
+        self._drum_moved = False             # a clean cycle ran since the last trusted empty reading
+        self._high_candidate = None          # a sustained higher empty level under confirmation, kg
+        self._high_count = 0                 # consecutive idle+unoccupied readings agreeing with it
+        self._low_candidate = None           # a lower empty level under confirmation (drop > BASELINE_DROP_KG)
+        self._low_count = 0
         self._litter_hist = collections.deque(maxlen=LITTER_WEIGHT_SAMPLES)  # recent trusted baselines, kg
-        self._litter_offset = 0.0            # kg added to the raw empty scale after a power-up re-zero
-        self._litter_known = None            # last published litter_weight (persisted), kg
-        self._new_box_session = False
-        self._load_litter()
-        if self._litter_known is not None:
-            self.state["litter_weight"] = self._litter_known   # restart: no blank litter sensor
-        self._visit_saw_cycle = False        # this occupancy overlapped a clean cycle (state not idle)
-        self._closed_visit = None            # last closed occupancy awaiting a late box report
-        self._pending_visit = None           # {time, peak, duration} captured at the visit report
-        self.recent_visits = collections.deque(maxlen=VISITS_KEEP)  # oldest -> newest
-        self._load_visits()
-        # Cat identification + weight tracking (pure analysis of the settled weight; see cats.py).
-        # Off (None) unless CATLINK_CATS names 1 or 2 cats.
-        self.cats = CatTracker(cats, cats_file) if cats else None
-        if self.cats is not None:
-            self.state.update(self.cats._fields())   # seed the cat sensors before the first visit
-        self._restore_last_visit()
+        self._litter_offset = 0.0             # kg added to the raw empty scale after a box power-up re-zero
+        self._litter_known = None             # last published litter_weight (persisted), kg
+        self._litter_offset_known = True      # False while litter.json could not be read/trusted: the re-zero
+                                              # offset is unknown, so litter_weight is NOT published (and the file
+                                              # is not overwritten) until the Litter reset button
+        self._new_box_session = False         # a re-zero check is due (once per box session)
+        self._session_raw = []                # this session's idle+empty raw readings until the check decides
+        # Visit state machine: one open occupancy, plus closed ones awaiting a (late) box report.
+        self._occ = None
+        self._closed = []
+        self._occ_seq = 0
+        self._last_report = None              # (body, monotonic) of the previous box report (duplicate guard)
+        self._paired_reports = []             # [(body, monotonic)] reports paired within LATE_REPORT_GRACE_S
+        self._newest_end = 0.0                # end time of the newest finalized visit (row order, last_visit_*)
+        self.recent_visits = collections.deque(maxlen=VISITS_KEEP)  # oldest -> newest (by end time)
+        # Cat identification + weight tracking (pure analysis; see cats.py). None unless CATLINK_CATS names cats.
+        self.cats = None
+        # Every load is isolated: a bad file is quarantined by its loader; nothing here may raise (a crash loop
+        # would take the box's broker down). This is the last line.
+        for step in (self._load_litter, self._load_visits, self._load_cats, self._restore_last_visit):
+            try:
+                step()
+            except Exception as exc:  # pragma: no cover - defensive
+                log("state_restore_error", step=step.__name__, error=type(exc).__name__)
+
+    # ---- cat tracker ----------------------------------------------------------------------------
+    def _window(self, now_w):
+        """The whole-one-cat weight window (kg) the pipeline keeps readings in."""
+        if self.cats is None:
+            return NO_CATS_WINDOW_KG
+        return self.cats.plausible_range(now_w)
+
+    def _load_cats(self):
+        """The tracker persists to cats_v2.json and reads cats.json (the 0.1 format) only to migrate, never writes
+        it, so a downgrade finds it untouched. Its loader validates every field; anything it still raises on must
+        not stop the gateway: quarantine the v2 file, then the v1 file, then run without persistence.
+        A stale cats_v2.json: after a downgrade the older gateway kept writing cats.json (a visit, a weigh-in, a
+        correction), so cats.json is no longer the file the tracker migrated. Then the newer cats.json is the truth:
+        the stale v2 is moved aside (kept, logged) and cats.json migrated again. When v2 is created, the sha256 of
+        the cats.json bytes it came from is stamped into the tracker's own "v1" record (saved and loaded verbatim):
+        stale = that sha differs (content, not mtime: a host without an RTC battery can boot with a stale clock).
+        A v2 without the stamp falls back to the migrated visit counts, normalised the tracker's way."""
+        if not self.cat_config:
+            return
+        names = tuple(slug for slug, _ in self.cat_config)
+        seeds = dict(self.cat_config)
+        path = self.cats_file
+        v2 = v2_path_for(path)
+        if path:
+            try:
+                if os.path.exists(v2) and os.path.exists(path):
+                    stale, why = self._v2_is_stale(v2)
+                    if stale:
+                        dest = "%s.stale-%s" % (v2, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+                        os.replace(v2, dest)
+                        log("cats_v2_stale", moved_to=os.path.basename(dest), why=why)
+            except Exception as exc:
+                log("cats_v2_stale_check_failed", error=type(exc).__name__)
+        created = bool(path) and not os.path.exists(v2)
+        for bad in (None, v2, path, "no-persistence"):
+            if bad == "no-persistence" or not path:
+                if path:
+                    log("cats_state_unusable", running_without_persistence=True)
+                self.cats = CatTracker(names, seeds, None, now=time.time())
+                break
+            if bad is not None and os.path.exists(bad):
+                _quarantine(bad, "cats_v2" if bad != path else "cats", "tracker_init")
+                created = True
+            try:
+                self.cats = CatTracker(names, seeds, path, now=time.time())
+                if created or not os.path.exists(v2):
+                    # a migration (or a fresh start) is on disk at once, stamped with the cats.json it came from
+                    self._stamp_v1_source()
+                    self.cats.save()
+                break
+            except Exception as exc:
+                log("cats_tracker_init_error", error=type(exc).__name__)
+        last = self.recent_visits[-1] if self.recent_visits else None
+        if last is not None:
+            try:
+                self.cats.attach_last_record(last)
+            except Exception as exc:  # pragma: no cover - defensive
+                log("cat_restore_error", error=type(exc).__name__)
+
+    @staticmethod
+    def _file_sha256(path):
+        try:
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            return None
+
+    def _stamp_v1_source(self):
+        """Record which cats.json bytes this v2 state came from (sha256; None = there was no cats.json)."""
+        v1 = getattr(self.cats, "v1", None)
+        if not isinstance(v1, dict):
+            v1 = {}
+        v1["cats_json_sha256"] = self._file_sha256(self.cats_file) if os.path.exists(self.cats_file) else None
+        self.cats.v1 = v1
+
+    def _v2_is_stale(self, v2):
+        """(stale, why): has cats.json changed since the tracker's v2 state was made from it?"""
+        with open(v2) as fh:
+            snap = json.load(fh).get("v1")
+        snap = snap if isinstance(snap, dict) else {}
+        now_sha = self._file_sha256(self.cats_file)
+        if "cats_json_sha256" in snap:
+            if now_sha is not None and snap["cats_json_sha256"] != now_sha:
+                return True, "cats.json changed since the migration (sha256)"
+            return False, None
+        # no stamp: the migrated visit counts, normalised like the tracker
+        try:
+            with open(self.cats_file) as fh:
+                cur = json.load(fh)
+        except Exception:
+            return False, None              # an unreadable / corrupt cats.json never invalidates v2
+        names = {slug for slug, _ in self.cat_config}
+        if not (isinstance(cur, dict) and isinstance(cur.get("refs"), dict) and set(cur["refs"]) == names):
+            return False, None
+        norm = lambda d, k: d[k] if isinstance(d.get(k), int) and not isinstance(d.get(k), bool) and d[k] >= 0 else 0  # noqa: E731
+        now_counts = (norm(cur, "total_visits"), norm(cur, "labelled_visits"))
+        was = (norm(snap, "total_visits"), norm(snap, "labelled_visits"))
+        if not snap or now_counts != was:
+            return True, "cats.json visit counts %s differ from the migrated %s" % (now_counts, was)
+        return False, None
 
     def _restore_last_visit(self):
-        """Seed the last-visit sensors from the persisted visit log, so a restart republishes the real
-        last visit instead of leaving HA with whatever it held before (or nothing). Best-effort."""
+        """Restore the last visit's weight / box report / duration / deposit from the persisted visit log, so a
+        restart republishes the real last visit instead of a stale value."""
+        if self._litter_known is not None and self._litter_offset_known:
+            self.state["litter_weight"] = self._litter_known   # restart: no blank litter sensor
         last = self.recent_visits[-1] if self.recent_visits else None
         if not isinstance(last, dict):
             return
-        try:
-            if isinstance(last.get("weight"), (int, float)) and not isinstance(last.get("weight"), bool):
-                self.state["last_visit_weight"] = last["weight"]
-            if isinstance(last.get("deposit"), int) and not isinstance(last.get("deposit"), bool):
-                self.state["last_deposit_weight"] = last["deposit"]
-            match = re.match(r"^(\d+)m (\d+)s$", str(last.get("duration", "")))
-            if match:
-                mm, ss = int(match.group(1)), int(match.group(2))
-                self.state["last_visit_duration"] = "%d:%02d" % (mm, ss)
-                self.state["last_visit_seconds"] = mm * 60 + ss
-            if self.cats is not None and last.get("cat") in self.cats.CATS + ("unknown",):
-                self.state.update(self.cats._fields(last_cat=last["cat"], last_conf=int(last.get("conf", 0))))
-        except (TypeError, ValueError):
-            pass
+        weight = _num_or_none(last.get("weight"), 0.0, STATE_W_MAX)
+        if weight is not None or "weight" in last and last["weight"] is None:
+            self.state["last_visit_weight"] = weight
+        peak = _num_or_none(last.get("peak"), 0.0, 100.0)
+        if peak is not None:
+            self.state["last_visit_peak"] = peak
+        dep = last.get("deposit")
+        if (dep is None and "deposit" in last) or (isinstance(dep, int) and not isinstance(dep, bool)
+                                                   and 0 <= dep <= DEPOSIT_MAX_G):
+            self.state["last_deposit_weight"] = dep
+        secs = _row_seconds(last)
+        if secs is not None:
+            self.state["last_visit_duration"] = "%d:%02d" % divmod(secs, 60)
+            self.state["last_visit_seconds"] = secs
+        if isinstance(last.get("ts"), str):
+            self.state["last_visit_at"] = last["ts"]
+        self._newest_end = _row_epoch(last) or 0.0
 
     def _touch(self):
         self.dirty.set()
 
     def correct_last(self, payload):
-        """GATEWAY-INTERNAL: relabel the most recent visit (payload = a cat slug). Never touches the box
-        or any interlock. Runs on the HA reader thread; isolated by the lock + the caller's try/except."""
+        """GATEWAY-INTERNAL: relabel the most recent visit (payload = a cat slug, or "unknown"). Never touches the
+        box or any interlock. Runs on the HA reader thread; isolated by the lock + the caller's try/except."""
         if self.cats is None:
             return None
         cat = (payload or "").strip().lower()
         with self.lock:
-            fields = self.cats.correct_last(cat)
+            fields = self.cats.correct_last(cat, time.time())
             if fields is not None:
-                self.state.update(fields)
                 self.cats.save()
+                self._persist_visits()     # the relabelled row (the dashboard table reads it)
                 self._touch()
         return fields
 
     def set_ref(self, cat, payload):
-        """GATEWAY-INTERNAL: set a per-cat reference from a manual weigh-in (payload kg). Never touches
-        the box or any interlock."""
+        """GATEWAY-INTERNAL: a kitchen-scale weigh-in of one cat (payload kg). Never touches the box or any
+        interlock."""
         if self.cats is None:
             return None
         with self.lock:
-            fields = self.cats.set_ref(cat, payload)
+            fields = self.cats.set_ref(cat, payload, time.time())
             if fields is not None:
-                self.state.update(fields)
                 self.cats.save()
                 self._touch()
         return fields
@@ -314,251 +649,544 @@ class GatewayState:
             self.prev_unmapped = unmapped
             self._touch()
 
+    # ---- visit state machine ------------------------------------------------------------------
     def _update_deposit(self):
-        """Estimate the deposit and the settled visit weight from the scale, defending against the
-        occupancy-lag and the 10 g noise floor. Called under self.lock, right after build_state. Pure
-        bookkeeping on self.state; never touches the box side. A rough estimate (scale noise ~20-30 g).
+        """Per-heartbeat visit + baseline bookkeeping. Called under self.lock right after build_state. Pure
+        bookkeeping on self.state; never touches the box side.
 
-        Three guards:
-          1. Baseline guard: the occupancy flag lags the scale by ~3 s, so a cat-on-scale reading can
-             arrive while occupied=0. A reading at/under baseline+EMPTY_BASELINE_MAX_JUMP is the normal
-             empty level (small drift, the tens-of-grams post-deposit shift) and is accepted. A reading
-             ABOVE that band is NOT accepted outright: it is either a ONE-OFF cat-on-scale lag reading
-             (rejected, last trusted baseline kept) OR a real litter top-up. A top-up is adopted only
-             once RELITTER_CONFIRM_SAMPLES consecutive idle+unoccupied readings agree within
-             RELITTER_TOLERANCE_KG -- so a >150 g re-litter is not rejected forever.
-          2. Deposit noise floor: a computed deposit below DEPOSIT_NOISE_FLOOR_G is at/under the scale
-             noise floor and is reported as 0 ("no measurable deposit").
-          3. Settled weight: the box's 0x025a weight is a max-hold peak that overstates. We collect the
-             genuine cat-on-scale samples (occupied AND clearly above the baseline, so the entry/exit lag
-             samples near empty are excluded) and report settled = MEDIAN(samples) - pre_visit_baseline,
-             which a single partial-support (low) sample cannot drag down the way min() could; with fewer
-             than MIN_SETTLED_SAMPLES genuine samples we fall back to the box max-hold peak.
-        A two-consecutive post-visit confirmation is intentionally NOT done: the live heartbeat cadence
-        gives only a single idle+unoccupied reading between a visit ending and the auto-clean, so
-        requiring two would drop visits or measure post-clean (clump already sifted)."""
+          * An occupancy opens on the first occupied reading and snapshots the pre-visit baseline (median of the
+            last BASELINE_EMPTIES trusted empties since the last clean/visit) and their spread. Every occupied
+            reading more than EMPTY_BASELINE_MAX_JUMP above it is a live sample (net kg, timestamped).
+          * It closes on the first idle+unoccupied reading back near the baseline. An unoccupied reading still
+            above baseline+0.15 is the cat still on the scale (the occupancy flag flapped) and HOLDS the visit
+            open -- until 2 consecutive held readings agree within VISIT_HOLD_AGREE_KG at a level that is not a
+            cat (the new empty level: a big deposit / litter -> close, deposit from it) or VISIT_HOLD_MAX_S passes
+            (close; the occupied samples still give the weight; no deposit).
+          * Deposit = post - pre (0 under the noise floor or when the drum moved; None above DEPOSIT_MAX_G).
+          * A closed occupancy waits up to LATE_REPORT_GRACE_S for its box report (on_visit pairs it). If none
+            comes and it was a real visit (>= GATEWAY_VISIT_MIN_S, a plateau, no clean cycle), it is finalized
+            as a gateway-sourced visit; otherwise dropped and logged.
+          * Baseline guard: a reading > 0.15 above the baseline is adopted only after RELITTER_CONFIRM_SAMPLES
+            agreeing readings (litter top-up); one > BASELINE_DROP_KG below only after BASELINE_DROP_CONFIRM --
+            except the first empty reading after a clean cycle, which is adopted directly (the clean removed
+            litter)."""
         scale = self.state.get("live_scale")          # kg, from bytes 16-17
         occupied = self.state.get("occupied")
         idle = self.state.get("state") == "idle"
         if scale is None or occupied is None:
             return
-        # Cat just entered: snapshot the last TRUSTED empty baseline and start a settled-weight scan.
-        if occupied and not self._prev_occupied:
-            self._pre_visit_baseline = self._empty_baseline
-            self._visit_open = True
-            self._occupied_samples = []
-            self._visit_saw_cycle = False
-        # A cat that steps into a running clean cycle shows up as occupancy while the box is not idle
-        # (interrupted / cleaning): the drum is turned, so the scale does not carry the whole cat.
-        if self._visit_open and not idle:
-            self._visit_saw_cycle = True
-        # While occupied, collect every reading that is clearly a cat on the scale (above the baseline by
-        # more than the lag/noise band). The settled weight is the MEDIAN of these, not the max-hold peak.
-        if occupied and self._pre_visit_baseline is not None:
-            if scale - self._pre_visit_baseline > EMPTY_BASELINE_MAX_JUMP:
-                self._occupied_samples.append(scale)
-        # Stable empty reading (box idle and unoccupied): on the first such reading after a visit,
-        # finalize the deposit + settled weight; then settle the baseline behind the jump guard.
-        if idle and not occupied:
-            if self._visit_open and self._pre_visit_baseline is not None:
-                grams = int(round((scale - self._pre_visit_baseline) * 1000))
-                if grams < 0:                          # noise or a scale re-zero -> treat as none
-                    grams = 0
-                if grams < DEPOSIT_NOISE_FLOOR_G:      # at/under the 10 g scale noise floor -> none
-                    grams = 0
-                if self._visit_saw_cycle:              # the drum moved mid-visit: the shift is not a deposit
-                    grams = 0
-                self.state["last_deposit_weight"] = grams
-                # Finalize the visit now that its deposit + settled weight are known: append + persist
-                # the record so the recent-visits table includes it and survives restarts.
-                if self._pending_visit is not None:
-                    self._finalize_visit(self._pending_visit, list(self._occupied_samples),
-                                         self._pre_visit_baseline, grams, orphan=self._visit_saw_cycle)
-                    self._pending_visit = None
-                    self._closed_visit = None
-                else:
-                    # The box sometimes reports a visit only AFTER the occupancy closed (a cat that stepped
-                    # into a clean cycle: the report follows the resumed cycle). Keep this occupancy's data
-                    # briefly so that late report is paired with it, never with a later, unrelated one.
-                    self._closed_visit = {"at": time.monotonic(), "samples": list(self._occupied_samples),
-                                          "pre": self._pre_visit_baseline, "grams": grams,
-                                          "saw_cycle": self._visit_saw_cycle}
-                self._visit_open = False
-                self._occupied_samples = []
-            # Baseline guard. At/under baseline+band == the normal empty level: accept and clear any
-            # pending re-litter candidate. Above the band while idle+unoccupied == either a one-off
-            # cat-on-scale lag reading (keep the trusted baseline) or a real litter top-up: adopt the
-            # higher level only after RELITTER_CONFIRM_SAMPLES consecutive readings agree within tolerance.
-            if self._empty_baseline is None or scale <= self._empty_baseline + EMPTY_BASELINE_MAX_JUMP:
-                self._empty_baseline = scale
-                self._high_candidate = None
-                self._high_count = 0
-            else:
-                if (self._high_candidate is not None
-                        and abs(scale - self._high_candidate) <= RELITTER_TOLERANCE_KG):
-                    self._high_count += 1
-                else:
-                    self._high_candidate = scale
-                    self._high_count = 1
-                if self._high_count >= RELITTER_CONFIRM_SAMPLES:
-                    self._empty_baseline = scale
-                    self._high_candidate = None
-                    self._high_count = 0
-            # Litter weight = median of the last few TRUSTED empty baselines (idle, unoccupied; a one-off
-            # high lag reading is already rejected above, the median rides out a one-off low one). The box
-            # has no litter-level sensor; HA derives "litter low" from this (see docs/DESIGN.md).
-            if self._empty_baseline is not None:
-                raw = self._empty_baseline
-                if self._new_box_session:
-                    # First trusted empty reading of a new box session. The box re-zeroes at power-up with
-                    # the litter in it: near 0 now, but substantial before -> carry the old weight over.
-                    self._new_box_session = False
-                    prev = self._litter_known
-                    if prev is not None and prev >= LITTER_REZERO_MIN_PREV and raw <= LITTER_REZERO_MAX_NOW:
-                        self._litter_offset = round(prev - raw, 2)
-                        self._litter_hist.clear()
-                        log("litter_rezero", prev=prev, raw=raw, offset=self._litter_offset)
-                        self._persist_litter()
-                self._litter_hist.append(raw)
-                if len(self._litter_hist) >= LITTER_WEIGHT_MIN_SAMPLES:
-                    lw = round(statistics.median(self._litter_hist) + self._litter_offset, 2)
-                    self.state["litter_weight"] = lw
-                    if lw != self._litter_known:
-                        self._litter_known = lw
-                        self._persist_litter()
-        self._prev_occupied = occupied
+        now_m, now_w = time.monotonic(), time.time()
+        self._expire_closed(now_m)
+        if not idle:
+            self._empties.clear()                     # the drum moves: a new baseline window after the cycle
+            self._drum_moved = True
+        occ = self._occ
+        if occupied:
+            if occ is None:
+                occ = self._occ = self._open_occupancy(now_m, now_w)
+            occ["hold"] = []                          # (a flap: the same visit continues)
+            occ["last_occ_m"], occ["last_occ_w"] = now_m, now_w
+            if not idle:                              # a cat in a running/interrupted clean cycle
+                occ["saw_cycle"] = True
+                occ["cycle_seen"] = True
+            self._sample(occ, scale, now_w)
+            return
+        if not idle:
+            if occ is not None:
+                occ["cycle_seen"] = True              # the drum moved after the cat left: no deposit
+            return
+        # idle and not occupied
+        if occ is not None:
+            pre = occ["pre"]
+            if pre is not None and not occ["cycle_seen"] and scale - pre > EMPTY_BASELINE_MAX_JUMP:
+                # still loaded: the cat (occupancy flap) -- or a new level (big deposit / litter added)
+                hold = occ["hold"]
+                if not hold:
+                    occ["hold_since"] = now_m
+                    log("visit_hold", occ=occ["id"], scale=scale, pre=pre)
+                hold.append(scale)
+                # 2 agreeing held readings settle the hold only if the level is NOT a cat (a big deposit / litter
+                # added, below the whole-cat window by a margin): a cat sitting still with the flag off would also
+                # read steady, and must not be split into two visits -- it is held until the cap instead.
+                not_a_cat = scale - pre < self._window(now_w)[0] - VISIT_HOLD_NOT_CAT_MARGIN_KG
+                if not_a_cat and len(hold) >= 2 and abs(hold[-1] - hold[-2]) <= VISIT_HOLD_AGREE_KG + 1e-9:
+                    log("visit_hold_settled", occ=occ["id"], level=scale)
+                    self._close_occupancy(occ, scale, now_m, now_w)     # the new empty level
+                    self._baseline_update(scale)
+                    self._litter_update(scale)
+                    return
+                if now_m - occ["hold_since"] < VISIT_HOLD_MAX_S:
+                    return
+                occ["forced"] = True
+                log("visit_hold_cap", occ=occ["id"], seconds=int(now_m - occ["opened_m"]))
+                self._close_occupancy(occ, None, now_m, now_w)
+                return                                # still not an empty reading: no baseline update
+            self._close_occupancy(occ, scale, now_m, now_w)
+        self._baseline_update(scale)
+        self._litter_update(scale)
 
-    def _finalize_visit(self, pending, samples, pre, grams, orphan=False):
-        """Append + persist one completed visit with its settled weight, deposit and cat label. Called
-        under self.lock. `orphan`: the visit overlapped a clean cycle, so its weight is not one cat."""
-        record = dict(pending)
-        peak = record.get("peak")
-        is_settled = pre is not None and len(samples) >= MIN_SETTLED_SAMPLES
-        if is_settled:
-            settled = round(statistics.median(samples) - pre, 2)
-            if settled < 0:
-                settled = 0.0
-        else:                                          # too few genuine samples -> box max-hold peak
-            settled = peak
-        record["weight"] = settled
-        record["deposit"] = grams
-        if orphan:
-            record["during_clean"] = True
-        self.state["last_visit_weight"] = settled
-        # Cat identification: label this visit from its settled weight and update the tracked weights.
-        # PURE ANALYSIS -- fully isolated so it can never break decode or reach the box side.
+    def _open_occupancy(self, now_m, now_w):
+        self._occ_seq += 1
+        empties = list(self._empties)
+        return {"id": self._occ_seq, "opened_m": now_m, "opened_w": now_w, "last_occ_m": now_m,
+                "last_occ_w": now_w, "pre": self._empty_baseline,
+                "pre_spread": round(max(empties) - min(empties), 3) if empties else None,
+                # a drop under confirmation when the cat entered: the weight could be off by it (flagged)
+                "baseline_alt": self._low_candidate,
+                "samples": [], "saw_cycle": False, "cycle_seen": False, "hold": [], "hold_since": None,
+                "forced": False, "reports": [], "post": None, "grams": None, "closed_m": None, "closed_w": None}
+
+    @staticmethod
+    def _sample(occ, scale, now_w):
+        pre = occ["pre"]
+        if pre is not None and scale - pre > EMPTY_BASELINE_MAX_JUMP:
+            occ["samples"].append((now_w, round(scale - pre, 3)))
+
+    def _close_occupancy(self, occ, post, now_m, now_w):
+        pre = occ["pre"]
+        grams = None
+        if pre is not None and post is not None:
+            grams = int(round((post - pre) * 1000))
+            if grams < DEPOSIT_NOISE_FLOOR_G:      # noise, a re-zero, or litter kicked out -> none
+                grams = 0
+            if occ["cycle_seen"]:                  # the drum moved mid/after-visit: the shift is not a deposit
+                grams = 0
+            if grams > DEPOSIT_MAX_G:              # reachable: a held visit settling > 0.30 kg up (litter added)
+                log("deposit_implausible", occ=occ["id"], grams=grams)
+                grams = None
+        self.state["last_deposit_weight"] = grams
+        occ.update(post=post, grams=grams, closed_m=now_m, closed_w=now_w)
+        self._occ = None
+        self._empties.clear()                      # the post-visit level starts a new baseline window
+        if occ["reports"]:
+            self._finalize(occ, occ["reports"], "box")
+        else:
+            self._closed.append(occ)               # wait for a late report (or become a gateway visit)
+
+    def _occ_seconds(self, occ, now_m=None):
+        end = occ["last_occ_m"] if occ["closed_m"] is not None else (now_m if now_m is not None else occ["last_occ_m"])
+        return max(0, int(round(end - occ["opened_m"])))
+
+    def _gateway_eligible(self, occ):
+        if occ["saw_cycle"] or occ["pre"] is None:
+            return False
+        if self._occ_seconds(occ) < GATEWAY_VISIT_MIN_S:
+            return False
+        lo, hi = self._window(time.time())
+        segs, _ = visit_segments(occ["samples"], lo, hi)
+        return any(s["n"] >= GATEWAY_VISIT_MIN_SAMPLES for s in segs)
+
+    def _expire_closed(self, now_m, flush=False):
+        if not self._closed:
+            return
+        keep = []
+        for occ in self._closed:
+            if not flush and now_m - occ["closed_m"] <= LATE_REPORT_GRACE_S:
+                keep.append(occ)
+            elif self._gateway_eligible(occ):
+                self._finalize(occ, [], "gateway")
+            else:
+                log("occupancy_unreported", occ=occ["id"], seconds=self._occ_seconds(occ),
+                    samples=len(occ["samples"]), during_clean=occ["saw_cycle"])
+        self._closed = keep
+
+    # ---- baseline + litter ----------------------------------------------------------------------
+    def _accept_empty(self, scale):
+        self._empties.append(scale)
+        self._empty_baseline = round(statistics.median(self._empties), 3)
+        self._high_candidate, self._high_count = None, 0
+        self._low_candidate, self._low_count = None, 0
+        self._drum_moved = False
+
+    def _baseline_update(self, scale):
+        base = self._empty_baseline
+        if base is None:
+            self._accept_empty(scale)
+            return
+        s_g, b_g = int(round(scale * 1000)), int(round(base * 1000))
+        if s_g > b_g + int(round(EMPTY_BASELINE_MAX_JUMP * 1000)):
+            # one-off cat-on-scale lag reading (rejected) or a real litter top-up (adopted once confirmed)
+            self._low_candidate, self._low_count = None, 0
+            if self._high_candidate is not None and abs(scale - self._high_candidate) <= RELITTER_TOLERANCE_KG:
+                self._high_count += 1
+            else:
+                self._high_candidate, self._high_count = scale, 1
+            if self._high_count >= RELITTER_CONFIRM_SAMPLES:
+                self._empties.clear()
+                self._accept_empty(scale)
+        elif s_g < b_g - int(round(BASELINE_DROP_KG * 1000)):
+            self._high_candidate, self._high_count = None, 0
+            if self._drum_moved:
+                # first empty reading after a clean cycle: the clean really removed litter -> adopt now
+                self._empties.clear()
+                self._accept_empty(scale)
+                return
+            # outside a cycle: a one-off low reading (a hand, handling) or real litter removal
+            if self._low_candidate is not None and abs(scale - self._low_candidate) <= BASELINE_DROP_AGREE_KG + 1e-9:
+                self._low_count += 1
+            else:
+                self._low_candidate, self._low_count = scale, 1
+            if self._low_count >= BASELINE_DROP_CONFIRM:
+                first = self._low_candidate
+                self._empties.clear()
+                self._empties.append(first)
+                self._accept_empty(scale)
+        else:
+            self._accept_empty(scale)
+
+    def _litter_update(self, scale):
+        """litter_weight = median of the last few trusted baselines (+ the carried re-zero offset). Pure
+        analysis for an HA "litter low" alarm; the box itself has no litter-level sensor."""
+        if self._empty_baseline is None:
+            return
+        if self._new_box_session:
+            # Once per box session, from 2 agreeing raw readings: did the box re-zero with the litter in it?
+            self._session_raw = (self._session_raw + [scale])[-2:]
+            if len(self._session_raw) < 2 or abs(self._session_raw[0] - self._session_raw[1]) > LITTER_REZERO_AGREE_KG + 1e-9:
+                return                                 # undecided: keep the published litter weight as is
+            raw = round((self._session_raw[0] + self._session_raw[1]) / 2.0, 3)
+            self._new_box_session = False
+            self._session_raw = []
+            prev = self._litter_known
+            if (prev is not None and prev >= LITTER_REZERO_MIN_PREV and raw <= LITTER_REZERO_MAX_NOW
+                    and (prev - self._litter_offset) - raw >= LITTER_REZERO_MIN_DROP):
+                self._litter_offset = round(prev - raw, 2)
+                self._litter_hist.clear()
+                log("litter_rezero", prev=prev, raw=raw, offset=self._litter_offset)
+                self._persist_litter()
+        self._litter_hist.append(self._empty_baseline)
+        if not self._litter_offset_known:
+            self.state.pop("litter_weight", None)       # offset unknown: no (possibly ~0 kg) litter weight
+            return
+        if len(self._litter_hist) >= LITTER_WEIGHT_MIN_SAMPLES:
+            lw = round(statistics.median(self._litter_hist) + self._litter_offset, 2)
+            self.state["litter_weight"] = lw
+            if lw != self._litter_known:
+                self._litter_known = lw
+                self._persist_litter()
+
+    # ---- finalize -----------------------------------------------------------------------------
+    def _finalize(self, occ, reports, source):
+        """Build the per-visit observation, let the tracker label it, insert + persist the visit row (in time
+        order). Called under self.lock. `occ` None = a box report with nothing to measure it against (orphan).
+        `reports` = the occupancy's box reports (0, 1, or 2 for two cats in one continuous occupancy)."""
+        now_w = time.time()
+        reports = list(reports or [])
+        forced = bool(occ and occ["forced"])
+        during_clean = bool(occ and occ["saw_cycle"])
+        pre = occ["pre"] if occ else None
+        segs, info = [], {"tie": False}
+        if occ is not None and pre is not None and not during_clean:
+            lo, hi = self._window(now_w)
+            segs, info = visit_segments(occ["samples"], lo, hi)
+        orphan_reports = []
+        if len(reports) == 2 and len(segs) != 2:
+            orphan_reports = reports[1:]           # a second report with no second cat: its own unknown row
+            reports = reports[:1]
+        # each segment's box-report cross-check: its own report (two reports = two cats, chronological), else the
+        # one report of the visit
+        for i, s in enumerate(segs):
+            if reports:
+                rep = reports[i] if len(reports) == len(segs) else reports[0]
+                s["peak_delta"] = round(rep["peak"] - s["w"], 3)
+        peak = reports[0]["peak"] if reports else None
+        if reports:
+            dur_s = sum(r["dur_s"] for r in reports)
+            # the visit's end: its report (sent at exit), or the close if the report came late
+            end_w = reports[-1]["at_w"] if occ is None else min(occ["closed_w"] or reports[-1]["at_w"],
+                                                                  reports[-1]["at_w"])
+        else:
+            dur_s, end_w = self._occ_seconds(occ), occ["closed_w"] or occ["last_occ_w"]
+        newest = end_w >= self._newest_end
+        obs = {"t": end_w, "duration_s": dur_s, "source": source,
+               "above_window": int(info.get("above") or 0),   # readings dropped above the window (diagnostic)
+               "segments": [dict(s) for s in segs],
+               # two box reports in one occupancy = the box counted two visits: the tracker gets their total, its
+               # "both cats at once" evidence against "the same cat on both plateaus" (only when each report
+               # agrees with its own plateau; else the first report)
+               "peak": (round(sum(r["peak"] for r in reports), 2)
+                        if len(reports) == 2 and len(segs) == 2
+                        and all(s.get("peak_delta") is not None and abs(s["peak_delta"]) <= TWO_REPORT_AGREE_KG + 1e-9
+                                for s in segs)
+                        else peak),
+               "baseline_unc": occ["pre_spread"] if occ else None,
+               "clamped": pre is not None and pre <= BASELINE_CLAMP_KG, "orphan": occ is None,
+               "during_clean": during_clean, "pre": pre, "newest": newest,
+               "baseline_alt": occ["baseline_alt"] if occ else None}
+        when = datetime.datetime.fromtimestamp(end_w).astimezone()
+        record = {"time": when.strftime("%b %-d %H:%M"), "ts": when.isoformat(timespec="seconds"),
+                  "peak": peak, "duration": "%dm %02ds" % divmod(dur_s, 60),
+                  "weight": segs[0]["w"] if len(segs) == 1 else None,
+                  "deposit": occ["grams"] if occ else None, "source": source,
+                  "kind": ("two" if len(segs) == 2 else "none" if not segs
+                           else "single" if segs[0]["n"] < 2 else "plateau")}
+        if len(reports) == 2:
+            record["peaks"] = [r["peak"] for r in reports]
+        if segs:
+            record["n"] = [s["n"] for s in segs] if len(segs) == 2 else segs[0]["n"]
+        if len(segs) == 2:
+            record["weights"] = [s["w"] for s in segs]
+        for key, value in (("tie", info.get("tie") or None), ("pre", pre), ("baseline_unc", obs["baseline_unc"]),
+                           ("clamped", obs["clamped"] or None), ("during_clean", during_clean or None),
+                           ("held", forced or None), ("baseline_alt", obs["baseline_alt"])):
+            if value is not None:
+                record[key] = value
         if self.cats is not None:
             try:
-                self.state.update(self.cats.on_visit(settled, record, settled=is_settled, orphan=orphan))
+                self.cats.on_visit(obs, record, now_w)
                 self.cats.save()
-            except Exception as exc:  # pragma: no cover - defensive
+            except Exception as exc:  # pragma: no cover - defensive: never breaks decode or reaches the box side
                 log("cat_label_error", error=type(exc).__name__)
+        if record.get("cat") != "two_cats":
+            # one cat (or unknown, or no tracker): the row keeps ONE weight -- the kept plateau, else none
+            record.pop("weights", None)
+            record.pop("cats", None)
+            if isinstance(record.get("n"), list):
+                if record.get("weight") is None:
+                    record.pop("n", None)
+                else:
+                    record["n"] = max(record["n"])
+        if len(reports) == 2 and record.get("cat") != "two_cats" and self.cats is not None:
+            # two box reports but not two different cats (the tracker merged the plateaus): the box counted two
+            # visits, so the second report is its own unknown row (our count matches the box's counter)
+            orphan_reports.append(reports[1])
+            reports = reports[:1]
+            dur_s = reports[0]["dur_s"]
+            record.pop("peaks", None)
+            record["duration"] = "%dm %02ds" % divmod(dur_s, 60)
+        if newest:                                  # HA's "last visit" never goes back in time
+            self._newest_end = end_w
+            self.state["last_visit_weight"] = record.get("weight")   # never the box report (last_visit_peak)
+            self.state["last_visit_peak"] = peak
+            self.state["last_visit_duration"] = "%d:%02d" % divmod(dur_s, 60)
+            self.state["last_visit_seconds"] = dur_s
+            self.state["last_visit_at"] = record["ts"]
+        self._insert_row(record, end_w)
+        log("visit_finalized", source=source, kind=record["kind"], weight=record.get("weight"), n=record.get("n"),
+            cat=record.get("cat"), cats=record.get("cats"), deposit=record["deposit"], peak=peak, newest=newest)
+        for rep in orphan_reports:
+            self._finalize(None, [rep], "box")
+
+    def _insert_row(self, record, end_w):
+        """Append, then restore time order if this visit ended before an already-listed one."""
         self.recent_visits.append(record)
+        rows = list(self.recent_visits)
+        if len(rows) >= 2 and (_row_epoch(rows[-2]) or 0) > end_w:
+            rows.sort(key=lambda r: _row_epoch(r) or 0)
+            self.recent_visits.clear()
+            self.recent_visits.extend(rows)
         self._persist_visits()
+
+    def flush_inflight(self, timeout=2.0):
+        """On SIGTERM (upgrade/restart): finalize what would otherwise be lost -- an open occupancy whose box
+        report already arrived, and closed occupancies still waiting for a report that qualify as gateway
+        visits. Best-effort; never blocks long."""
+        if not self.lock.acquire(timeout=timeout):
+            return
+        try:
+            occ = self._occ
+            if occ is not None and occ["reports"]:
+                occ.update(closed_m=time.monotonic(), closed_w=time.time())
+                self._occ = None
+                self._finalize(occ, occ["reports"], "box")
+                log("visit_flushed_on_exit", occ=occ["id"])
+            self._expire_closed(time.monotonic(), flush=True)
+        finally:
+            self.lock.release()
+
+    def litter_reset(self):
+        """GATEWAY-INTERNAL (button): the box's zero is the EMPTY drum again. For a full litter change: empty
+        the drum, power-cycle the box, press this, refill. Drops the carried re-zero offset; the litter weight
+        re-appears after LITTER_WEIGHT_MIN_SAMPLES readings. Never touches the box."""
+        with self.lock:
+            self._litter_offset = 0.0
+            self._litter_offset_known = True
+            self._litter_known = None
+            self._litter_hist.clear()
+            self._new_box_session = False
+            self._session_raw = []
+            self.state.pop("litter_weight", None)
+            self._persist_litter()
+            log("litter_reset")
+            self._touch()
+        return True
 
     def on_box_session(self):
         """A new box MQTT session started (box boot, Wi-Fi reconnect, or a gateway restart)."""
         with self.lock:
             self._new_box_session = True
-
-    def litter_reset(self):
-        """GATEWAY-INTERNAL (button): the box's zero is the EMPTY drum again. For a full litter change:
-        empty the drum, power-cycle the box, press this, refill. Drops the carried re-zero offset; the litter
-        weight re-appears after LITTER_WEIGHT_MIN_SAMPLES readings. Never touches the box."""
-        with self.lock:
-            self._litter_offset = 0.0
-            self._litter_known = None
-            self._litter_hist.clear()
-            self._new_box_session = False
-            self.state.pop("litter_weight", None)
-            self._persist_litter()
-            log("litter_reset")
-            self._touch()
+            self._session_raw = []
 
     def _load_litter(self):
+        """litter.json; anything that does not parse or holds non-finite / out-of-range values is quarantined."""
         if not self.litter_file:
             return
         try:
             with open(self.litter_file) as handle:
-                data = json.load(handle)
-            off, known = data.get("offset", 0.0), data.get("litter_weight")
-            if isinstance(off, (int, float)) and not isinstance(off, bool) and 0 <= off <= 10:
-                self._litter_offset = float(off)
-            if isinstance(known, (int, float)) and not isinstance(known, bool) and 0 <= known <= 10:
-                self._litter_known = float(known)
-        except (OSError, ValueError, AttributeError):
-            pass
+                text_ = handle.read()
+        except FileNotFoundError:
+            return                                     # first run: no offset carried (true 0)
+        except Exception as exc:
+            reason = "unreadable_" + type(exc).__name__
+        else:
+            try:
+                data = json.loads(text_)
+                if not isinstance(data, dict):
+                    raise ValueError("not_an_object")
+                off = _fnum_range(data.get("offset", 0.0), 0.0, 10.0, "offset")
+                known = data.get("litter_weight")
+                known = _fnum_range(known, 0.0, 10.0, "litter_weight") if known is not None else None
+                self._litter_offset, self._litter_known = off, known
+                return
+            except Exception as exc:
+                reason = type(exc).__name__
+        # Unreadable or untrustworthy: the carried re-zero offset (often ~3 kg) is UNKNOWN -- never assume 0, or
+        # litter_weight would read ~0 and fire a false litter-low alarm. No litter weight until Litter reset.
+        _quarantine(self.litter_file, "litter", reason)
+        self._litter_offset_known = False
+        log("litter_offset_unknown", reason=reason)
 
     def _persist_litter(self):
-        """Atomic, best-effort; never raises. Written only when the rounded litter weight changes."""
-        if not self.litter_file:
+        """Atomic + fsync, best-effort; never raises. Written only when the rounded litter weight changes, and
+        never while the offset is unknown (that would replace the real offset with a guess)."""
+        if not self.litter_file or not self._litter_offset_known:
             return
         try:
-            tmp = self.litter_file + ".tmp"
-            with open(tmp, "w") as handle:
-                json.dump({"offset": self._litter_offset, "litter_weight": self._litter_known}, handle)
-            os.replace(tmp, self.litter_file)
+            _atomic_write(self.litter_file, json.dumps({"offset": self._litter_offset,
+                                                        "litter_weight": self._litter_known}))
         except OSError as exc:
             log("litter_persist_failed", error=type(exc).__name__)
 
     def _load_visits(self):
-        """Reload the persisted recent-visits log on startup. Best-effort; never raises."""
+        """Reload the persisted recent-visits log on startup. A line that does not parse (or holds NaN/inf, or
+        is pathologically nested) moves the file aside (.corrupt-<ts>, logged); the good rows are kept."""
         try:
             with open(self.visits_file) as handle:
-                rows = [json.loads(line) for line in handle if line.strip()]
-            for row in rows[-VISITS_KEEP:]:
-                if isinstance(row, dict):
-                    self.recent_visits.append(row)
-        except (OSError, ValueError):
-            pass
+                lines = [line for line in handle if line.strip()]
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            _quarantine(self.visits_file, "visits", "unreadable_" + type(exc).__name__)
+            return
+        rows, bad = [], 0
+        for line in lines:
+            try:
+                row = json.loads(line)
+                ok = isinstance(row, dict) and _finite_tree(row)
+            except Exception:
+                ok = False
+            if ok:
+                rows.append(row)
+            else:
+                bad += 1
+        if bad:
+            _quarantine(self.visits_file, "visits", "bad_lines_%d" % bad)
+        for row in rows[-VISITS_KEEP:]:
+            self.recent_visits.append(row)
 
     def _persist_visits(self):
-        """Write the rolling visit log atomically. Called under self.lock. Best-effort; never raises."""
+        """Write the rolling visit log atomically (+ fsync). Called under self.lock. Never raises."""
         try:
-            tmp = self.visits_file + ".tmp"
-            with open(tmp, "w") as handle:
-                for row in self.recent_visits:
-                    handle.write(json.dumps(row, separators=(",", ":")) + "\n")
-            os.replace(tmp, self.visits_file)
-        except OSError as exc:
+            _atomic_write(self.visits_file, "".join(json.dumps(_json_safe(row), separators=(",", ":")) + "\n"
+                                                    for row in self.recent_visits))
+        except (OSError, TypeError, ValueError) as exc:
             log("visits_persist_failed", error=type(exc).__name__)
 
+    def _pair_score(self, occ, dur_s, now_m):
+        """How far an occupancy's span is from a box report's duration, given the real bias: the occupancy runs
+        PAIR_BIAS_S longer than the box's own duration (7-32 s in every real pairing observed)."""
+        span = self._occ_seconds(occ, now_m) - sum(r["dur_s"] for r in occ["reports"])   # minus a first cat's
+        return abs(span - dur_s - PAIR_BIAS_S)
+
+    def _open_fits(self, occ, dur_s, now_m):
+        """The open occupancy can take this report: its span (minus a first cat's reported duration) runs
+        PAIR_OPEN_MIN_S..PAIR_OPEN_MAX_S longer than the report's duration."""
+        span = self._occ_seconds(occ, now_m) - sum(r["dur_s"] for r in occ["reports"])
+        return len(occ["reports"]) < 2 and PAIR_OPEN_MIN_S <= span - dur_s <= PAIR_OPEN_MAX_S
+
     def on_visit(self, body):
-        # Body: 01 03 mm ss kg cg  -- duration minutes:seconds, weight kg.hundredths (max-hold; can overstate).
+        """The box's visit report, body `01 03 mm ss kg cg` (duration mm:ss, a weight kg.hundredths that is NOT
+        a reliable weight). Pairing, in order:
+          1. a byte-identical report within REPORT_DUP_S, or identical to one already paired within
+             LATE_REPORT_GRACE_S, is a redelivery -> ignored;
+          2. the open occupancy, when its span fits the report (the box reports at the cat's exit); a second
+             report on it = the second cat of one continuous occupancy;
+          3. else the best occupancy that closed within LATE_REPORT_GRACE_S (or the open one if it fits), by
+             duration with the real span bias, accepted only with a score <= PAIR_SCORE_MAX_S;
+          4. else it upgrades a gateway-sourced row whose visit it overlaps (matching duration);
+          5. else its own unknown row. A closed occupancy is never paired twice."""
         if len(body) >= 6:
             mm, ss, kg, cg = body[2], body[3], body[4], body[5]
-            now = datetime.datetime.now().astimezone()
             peak = round(kg + cg / 100.0, 2)
             with self.lock:
-                # Provisional: show the box's max-hold weight until _update_deposit replaces it with the
-                # settled weight (median cat-on-scale sample - baseline) when the visit finalizes.
-                self.state["last_visit_weight"] = peak
-                self.state["last_visit_duration"] = "%d:%02d" % (mm, ss)
-                self.state["last_visit_seconds"] = mm * 60 + ss
-                self.state["last_visit_at"] = now.isoformat(timespec="seconds")
-                # Stage the visit row (host clock; the box clock is unreliable). It is appended to the
-                # recent-visits log once _update_deposit computes this visit's deposit + settled weight,
-                # at which point `weight` becomes the settled value and `peak` keeps the box max-hold.
-                pending = {
-                    "time": now.strftime("%b %-d %H:%M"),
-                    "peak": peak,
-                    "duration": "%dm %02ds" % (mm, ss),
-                }
-                if self._visit_open:
-                    self._pending_visit = pending     # normal: finalized at the next idle+empty heartbeat
+                now_m, now_w = time.monotonic(), time.time()
+                key = bytes(body[:6])
+                self._paired_reports = [(k, t) for k, t in self._paired_reports if now_m - t <= LATE_REPORT_GRACE_S]
+                if (self._last_report is not None and self._last_report[0] == key
+                        and now_m - self._last_report[1] <= REPORT_DUP_S) \
+                        or any(k == key for k, _ in self._paired_reports):
+                    log("visit_report_duplicate", reported=mm * 60 + ss)
+                    return
+                self._last_report = (key, now_m)
+                report = {"peak": peak, "dur_s": mm * 60 + ss, "at_w": now_w}
+                cur = self._occ
+                cur_fits = cur is not None and self._open_fits(cur, report["dur_s"], now_m)
+                occ = None
+                if cur_fits and not cur["reports"]:
+                    occ = cur
                 else:
-                    # Late report: the occupancy already closed. Pair it with that occupancy if it closed
-                    # recently; otherwise there is nothing to measure it against. Either way finalize it
-                    # NOW so it can never attach to a later, unrelated visit.
-                    closed = self._closed_visit
-                    self._closed_visit = None
-                    if closed is not None and time.monotonic() - closed["at"] <= LATE_REPORT_GRACE_S:
-                        self._finalize_visit(pending, closed["samples"], closed["pre"], closed["grams"],
-                                             orphan=closed["saw_cycle"])
-                    else:
-                        self._finalize_visit(pending, [], None, 0, orphan=True)
-                    log("visit_late_report", paired=closed is not None)
+                    cands = [o for o in self._closed
+                             if not o["reports"] and now_m - o["closed_m"] <= LATE_REPORT_GRACE_S]
+                    if cur_fits:
+                        cands.append(cur)
+                    scored = [(self._pair_score(o, report["dur_s"], now_m), o) for o in cands]
+                    scored = [(sc, o) for sc, o in scored if sc <= PAIR_SCORE_MAX_S]
+                    if scored:
+                        # the best score; within 15 s of it -> the most recent (the box reports at exit)
+                        best = min(sc for sc, _ in scored)
+                        occ = max((o for sc, o in scored if sc <= best + 15), key=lambda o: o["opened_m"])
+                if occ is not None:
+                    self._paired_reports.append((key, now_m))
+                if occ is not None and occ is cur:
+                    occ["reports"].append(report)    # finalized when the occupancy closes
+                elif occ is not None:
+                    self._closed.remove(occ)
+                    occ["reports"].append(report)
+                    self._finalize(occ, occ["reports"], "box")
+                    log("visit_late_report", paired=True, occ=occ["id"], seconds=self._occ_seconds(occ),
+                        reported=report["dur_s"])
+                elif self._upgrade_gateway_row(report):
+                    self._paired_reports.append((key, now_m))
+                    log("visit_late_report", paired="gateway_row", reported=report["dur_s"])
+                else:
+                    self._finalize(None, [report], "box")
+                    log("visit_late_report", paired=False, reported=report["dur_s"])
                 self._touch()
+
+    def _upgrade_gateway_row(self, report):
+        """A report too late to pair: if a gateway-sourced row of matching duration (+-REPORT_UPGRADE_S around the
+        span bias) is the visit this report describes -- the report's visit (at_w - dur_s .. at_w) overlaps the
+        row (starts no later than REPORT_OVERLAP_S after the row ended) -- attach the report (source box) instead
+        of counting the visit twice. A report for a later visit (a cat in the box during a restart) never takes
+        an earlier cat's row: it becomes its own unknown row."""
+        for row in reversed(self.recent_visits):
+            end = _row_epoch(row)
+            secs = _row_seconds(row)
+            if row.get("source") != "gateway" or end is None or secs is None:
+                continue
+            if report["at_w"] - end > REPORT_UPGRADE_WINDOW_S or end > report["at_w"]:
+                continue
+            if report["at_w"] - report["dur_s"] > end + REPORT_OVERLAP_S:
+                continue
+            if abs(secs - report["dur_s"] - PAIR_BIAS_S) <= REPORT_UPGRADE_S:
+                row["source"] = "box"
+                row["upgraded_from"] = "gateway"
+                row["peak"] = report["peak"]
+                if row is self.recent_visits[-1]:
+                    self.state["last_visit_peak"] = report["peak"]
+                self._persist_visits()
+                return True
+        return False
 
     def on_unknown_frame(self, command, body):
         # Distinct, greppable log line so a brand-new signal type is easy to find in history.
@@ -574,12 +1202,39 @@ class GatewayState:
             self.diag["last_unknown_command"] = ("0x%04x" % command) if command is not None else "unparsable"
             self._touch()
 
+    def cat_payload(self):
+        """The retained cats-topic payload (JSON text), or None without cats / on an error. Called under the lock."""
+        if self.cats is None:
+            return None
+        try:
+            return json.dumps(_json_safe(_ha_cat_fields(self.cats.fields(time.time()), self.cats.CATS)),
+                              separators=(",", ":"), allow_nan=False)
+        except Exception as exc:  # pragma: no cover - defensive
+            log("cat_fields_error", error=type(exc).__name__)
+            return None
+
     def snapshot(self):
+        """(state, diag, visits JSON, fresh, cats JSON or None) for the HA bridge."""
         with self.lock:
             fresh = self.last_heartbeat_at is not None and (time.monotonic() - self.last_heartbeat_at) < OFFLINE_AFTER_S
             # recent_visits attribute payload, most recent first, for the visit_count sensor.
-            visits = json.dumps({"recent_visits": list(self.recent_visits)[::-1]}, separators=(",", ":"))
-            return dict(self.state), dict(self.diag), visits, fresh
+            visits = json.dumps({"recent_visits": _json_safe(list(self.recent_visits)[::-1])}, separators=(",", ":"))
+            return dict(self.state), dict(self.diag), visits, fresh, self.cat_payload()
+
+
+def build_gateway_state(cfg):
+    """GatewayState for a validated config. Last line: if building it still raises, the state files are
+    quarantined and it is built again from nothing -- never a crash loop of the box's broker on bad state."""
+    args = (cfg.visits_file, cfg.cats, cfg.cats_file, cfg.litter_file)
+    try:
+        return GatewayState(*args)
+    except Exception as exc:  # pragma: no cover - defensive
+        log("state_init_error", error=type(exc).__name__)
+        for path, what in ((cfg.cats_file, "cats"), (v2_path_for(cfg.cats_file), "cats_v2"),
+                           (cfg.visits_file, "visits"), (cfg.litter_file, "litter")):
+            if path and os.path.exists(path):
+                _quarantine(path, what, "init_" + type(exc).__name__)
+        return GatewayState(*args)
 
 
 GW = None
@@ -960,7 +1615,7 @@ def _avail_block():
 
 
 def _sensor(object_id, name, tmpl, topic=None, device_class=None, unit=None, diagnostic=False,
-            icon=None, json_attrs=None, measurement=False):
+            icon=None, json_attrs=None, measurement=False, state_class=None):
     cfg = {"name": name, "unique_id": NODE + "_" + object_id,
            "state_topic": topic or STATE_TOPIC, "value_template": tmpl, "device": DEVICE}
     cfg.update(_avail_block())
@@ -968,8 +1623,8 @@ def _sensor(object_id, name, tmpl, topic=None, device_class=None, unit=None, dia
         cfg["device_class"] = device_class
     if unit:
         cfg["unit_of_measurement"] = unit
-    if measurement:
-        cfg["state_class"] = "measurement"   # numeric reading: HA keeps long-term statistics
+    if measurement or state_class:
+        cfg["state_class"] = state_class or "measurement"   # numeric: HA keeps long-term statistics
     if diagnostic:
         cfg["entity_category"] = "diagnostic"
     if icon:
@@ -1036,37 +1691,100 @@ def sensor_discovery():
                 topic=DIAG_TOPIC, diagnostic=True),
         _sensor("last_unknown_command", "Last unknown frame", "{{ value_json.last_unknown_command | default(none) }}",
                 topic=DIAG_TOPIC, diagnostic=True, icon="mdi:alert-rhombus-outline"),
+        # The box's own visit report, kept apart from the visit weight (it is not a reliable weight).
+        _sensor("last_visit_peak", "Last visit box report", "{{ value_json.last_visit_peak | default(none) }}",
+                device_class="weight", unit="kg", diagnostic=True),
     ]
     items += cat_discovery()
     return items
 
 
 def cat_discovery():
-    """Cat identification sensors (read-only; only when CATLINK_CATS is set)."""
+    """Cat identification + weight tracking sensors (read-only; only when CATLINK_CATS is set). Every entity
+    reads CATS_TOPIC, a small retained payload published only when a cat field changes (never per heartbeat: no
+    recorder churn). The weight, status and last-visit sensors take that same payload as json_attributes, so a
+    dashboard can show the trend word, the weight range and the raw status without extra entities."""
     cats = CFG.cats if CFG is not None else []
     if not cats:
         return []
     items = []
     for slug, _ in cats:
         shown = display_name(slug)
-        # The weight sensors carry the whole state as json_attributes so a dashboard tile can show a
-        # plain-language trend word as secondary content without a second entity.
-        items.append(_sensor(slug + "_weight", shown + " weight", "{{ value_json.%s_weight }}" % slug,
-                             device_class="weight", unit="kg", icon="mdi:cat", json_attrs=STATE_TOPIC,
-                             measurement=True))
-        items.append(_sensor(slug + "_trend_7d", shown + " trend 7d", "{{ value_json.%s_trend_7d }}" % slug,
-                             unit="g", diagnostic=True, icon="mdi:trending-up"))
-    if len(cats) == 2:
-        items.append(_sensor("cat_gap", "Cat gap", "{{ value_json.cat_gap }}", unit="g", diagnostic=True,
-                             icon="mdi:arrow-expand-horizontal"))
-    # last_visit_cat is the diagnostic "Cat a 82%" text; last_cat / last_conf ride along as
-    # json_attributes so a dashboard can render a number-free label from them.
-    items.append(_sensor("last_visit_cat", "Last visit cat", "{{ value_json.last_visit_cat }}", icon="mdi:cat",
-                         json_attrs=STATE_TOPIC))
-    items.append(_sensor("labelled_pct", "Labelled pct", "{{ value_json.labelled_pct }}", unit="%",
-                         diagnostic=True, icon="mdi:label-percent"))
-    items.append(_sensor("correction_count", "Correction count", "{{ value_json.correction_count }}",
-                         diagnostic=True, icon="mdi:pencil"))
+        items += [
+            _sensor(slug + "_weight", shown + " weight", "{{ value_json.%s_weight }}" % slug, topic=CATS_TOPIC,
+                    device_class="weight", unit="kg", icon="mdi:cat", json_attrs=CATS_TOPIC, measurement=True),
+            _sensor(slug + "_trend_7d", shown + " growth", "{{ value_json.%s_growth_g_week }}" % slug,
+                    topic=CATS_TOPIC, unit="g/wk", diagnostic=True, icon="mdi:trending-up"),
+            _sensor(slug + "_visits", shown + " visits", "{{ value_json.%s_visits_total }}" % slug,
+                    topic=CATS_TOPIC, icon="mdi:counter", state_class="total_increasing"),
+            _sensor(slug + "_visits_24h", shown + " visits 24h", "{{ value_json.%s_visits_24h }}" % slug,
+                    topic=CATS_TOPIC, icon="mdi:counter", measurement=True),
+            _sensor(slug + "_last_seen", shown + " last seen", "{{ value_json.%s_last_seen }}" % slug,
+                    topic=CATS_TOPIC, device_class="timestamp", icon="mdi:cat"),
+            # why the weight is blank (readable text; the raw reason is the <slug>_stale_reason attribute)
+            _sensor(slug + "_stale_reason", shown + " weight status",
+                    ("{%% set r = value_json.%(c)s_stale_reason %%}"
+                     "{%% if r == 'not_seen' %%}{{ 'Not seen for 3 days' if value_json.%(c)s_last_seen else 'Not seen yet' }}"
+                     "{%% elif r == 'not_identified' %%}Not identified: weigh every cat"
+                     "{%% elif r == 'sudden_change' %%}Weight changed suddenly: weigh every cat"
+                     "{%% elif r == 'unavailable' %%}unavailable"
+                     "{%% elif value_json.%(c)s_weight is number %%}OK{%% else %%}Unknown{%% endif %%}") % {"c": slug},
+                    topic=CATS_TOPIC, icon="mdi:scale-unbalanced"),
+            # the published weight's +-2 sd interval (the weight is the track's prediction now)
+            _sensor(slug + "_weight_lo", shown + " weight low", "{{ value_json.%s_weight_lo_kg }}" % slug,
+                    topic=CATS_TOPIC, device_class="weight", unit="kg", icon="mdi:arrow-collapse-down",
+                    measurement=True),
+            _sensor(slug + "_weight_hi", shown + " weight high", "{{ value_json.%s_weight_hi_kg }}" % slug,
+                    topic=CATS_TOPIC, device_class="weight", unit="kg", icon="mdi:arrow-collapse-up",
+                    measurement=True),
+            _sensor(slug + "_last_weigh_in", shown + " last weigh-in",
+                    "{{ (value_json.%s_last_weigh_in or 'none yet')[:250] }}" % slug,
+                    topic=CATS_TOPIC, icon="mdi:scale"),
+        ]
+    if len(cats) >= 2:
+        items.append(_sensor("cat_gap", "Cat gap", "{{ value_json.cat_gap }}", topic=CATS_TOPIC, unit="g",
+                             diagnostic=True, icon="mdi:arrow-expand-horizontal"))
+    items += [
+        # readable text; the raw value (ok / learning / cant_tell_apart / needs_weigh_in) is the cat_status attribute
+        _sensor("cat_status", "Cat ID status",
+                "{{ {'ok': 'OK', 'learning': 'Learning the cats', 'cant_tell_apart': \"Can't tell them apart\", "
+                "'needs_weigh_in': 'Weigh every cat'}.get(value_json.cat_status, value_json.cat_status) }}",
+                topic=CATS_TOPIC, icon="mdi:cat", json_attrs=CATS_TOPIC),
+    ]
+    if len(cats) >= 2:
+        items += [
+            # the label-free weight clusters the box sees (published even while the cats can't be named)
+            _sensor("cluster_low", "Lightest cat cluster", "{{ value_json.cluster_low_kg }}", topic=CATS_TOPIC,
+                    device_class="weight", unit="kg", icon="mdi:scale"),
+            _sensor("cluster_high", "Heaviest cat cluster", "{{ value_json.cluster_high_kg }}", topic=CATS_TOPIC,
+                    device_class="weight", unit="kg", icon="mdi:scale"),
+            _sensor("cluster_low_n", "Lightest cluster visits", "{{ value_json.cluster_low_n }}", topic=CATS_TOPIC,
+                    diagnostic=True, icon="mdi:counter"),
+            _sensor("cluster_high_n", "Heaviest cluster visits", "{{ value_json.cluster_high_n }}",
+                    topic=CATS_TOPIC, diagnostic=True, icon="mdi:counter"),
+        ]
+    items += [
+        _sensor("visits_24h_total", "Visits 24h", "{{ value_json.visits_24h_total }}", topic=CATS_TOPIC,
+                diagnostic=True, icon="mdi:counter", measurement=True),
+        # the box read every cat heavier / lighter at once (litter top-up, tare drift): not an alarm
+        _sensor("scale_shift", "Scale shift", "{{ value_json.scale_shift if value_json.scale_shift else 'none' }}",
+                topic=CATS_TOPIC, diagnostic=True, icon="mdi:scale-balance"),
+        _sensor("readings_above_window_24h", "Readings above window 24h",
+                "{{ value_json.readings_above_window_24h }}", topic=CATS_TOPIC, diagnostic=True,
+                icon="mdi:arrow-collapse-up"),
+        # last_visit_cat: "Cat b 97%" / "Unknown" / "Cat a + Cat b"; last_cat / last_conf ride along as attributes
+        _sensor("last_visit_cat", "Last visit cat", "{{ value_json.last_visit_cat }}", topic=CATS_TOPIC,
+                icon="mdi:cat", json_attrs=CATS_TOPIC),
+        _sensor("labelled_pct", "Labelled 7d", "{{ value_json.labelled_pct_7d }}", topic=CATS_TOPIC, unit="%",
+                diagnostic=True, icon="mdi:label-percent"),
+        _sensor("correction_count", "Correction count", "{{ value_json.correction_count }}", topic=CATS_TOPIC,
+                diagnostic=True, icon="mdi:pencil"),
+        _sensor("unknown_visits", "Unknown visits", "{{ value_json.unknown_visits_total }}", topic=CATS_TOPIC,
+                diagnostic=True, icon="mdi:help-circle-outline", state_class="total_increasing"),
+    ]
+    if len(cats) >= 2:
+        items.append(_sensor("two_cat_visits", "Two-cat visits", "{{ value_json.two_cat_visits_total }}",
+                             topic=CATS_TOPIC, diagnostic=True, icon="mdi:cat", state_class="total_increasing"))
     return items
 
 
@@ -1235,9 +1953,10 @@ def ha_bridge():
             last_state_str = None   # publish STATE/DIAG/VISITS only when the serialized JSON changes,
             last_diag_str = None    # so unchanged retained payloads are not re-published every 5 s.
             last_visits_str = None
+            last_cats_str = None
             next_ping = time.monotonic() + client.keepalive / 2
             while not stop.is_set():
-                state, diag, visits_str, fresh = GW.snapshot()
+                state, diag, visits_str, fresh, cats_str = GW.snapshot()
                 avail = "online" if fresh else "offline"
                 if avail != last_avail:
                     client.publish(AVAIL_TOPIC, avail, retain=True)
@@ -1257,6 +1976,11 @@ def ha_bridge():
                 if visits_str != last_visits_str:
                     client.publish(VISITS_TOPIC, visits_str, retain=True)
                     last_visits_str = visits_str
+                # cat entities: their own small retained payload, only on change (a visit, a command, or a
+                # time-based field such as visits_24h / a stale weight ageing out)
+                if cats_str is not None and cats_str != last_cats_str:
+                    client.publish(CATS_TOPIC, cats_str, retain=True)
+                    last_cats_str = cats_str
                 # wake on new box data (dirty) or every 5 s to refresh availability / ping
                 GW.dirty.wait(timeout=5)
                 GW.dirty.clear()
@@ -1277,6 +2001,11 @@ def ha_bridge():
 # main
 # ====================================================================================================
 def on_term(_signum, _frame):
+    try:
+        if GW is not None:
+            GW.flush_inflight()      # pure analysis bookkeeping (a reported visit still open); never sends
+    except Exception as exc:  # pragma: no cover - defensive
+        log("flush_error", error=type(exc).__name__)
     log("broker_exit", reason="sigterm", code=0)
     os._exit(0)
 
@@ -1293,7 +2022,7 @@ def main():
     if cfg.skip_peer_check:
         log("peer_check_disabled", warning="CATLINK_SKIP_PEER_CHECK=1: ANY peer is accepted on the box port; "
                                            "for tests only")
-    GW = GatewayState(cfg.visits_file, cfg.cats, cfg.cats_file, cfg.litter_file)
+    GW = build_gateway_state(cfg)
     if not cfg.no_ha:
         threading.Thread(target=ha_bridge, daemon=True).start()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
